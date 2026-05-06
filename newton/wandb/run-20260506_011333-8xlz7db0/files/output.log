@@ -1,0 +1,19 @@
+W&B enabled | project=newton-contact-point-friction-fit | run=mujoco-fit-003 | mode=online
+Module __main__ ac6d493 load on device 'cuda:0' took 213.05 ms  (cached)
+Module newton_surface_points_diff_demo fa0f567 load on device 'cuda:0' took 206.96 ms  (cached)
+Module newton._src.solvers.xpbd.kernels e0894c1 load on device 'cuda:0' took 4517.46 ms  (cached)
+Module newton._src.solvers.solver 2c8892b load on device 'cuda:0' took 155.57 ms  (cached)
+iter=0001 forward progress 4/16 trajectories
+iter=0001 forward progress 8/16 trajectories
+iter=0001 forward progress 12/16 trajectories
+iter=0001 forward progress 16/16 trajectories
+iter=0001 loss=0.014180 pos=0.004147 ori=0.100327 linvel=0.000000 angvel=0.000000 grad_norm=nan mu_min=nan mu_max=nan batch=16/256 elapsed=175.63s
+iter=0002 forward progress 4/16 trajectories
+iter=0002 forward progress 8/16 trajectories
+iter=0002 forward progress 12/16 trajectories
+iter=0002 forward progress 16/16 trajectories
+iter=0002 loss=0.015734 pos=0.006139 ori=0.095945 linvel=0.000000 angvel=0.000000 grad_norm=0.000000 mu_min=nan mu_max=nan batch=16/256 elapsed=166.16s
+iter=0003 forward progress 4/16 trajectories
+iter=0003 forward progress 8/16 trajectories
+iter=0003 forward progress 12/16 trajectories
+iter=0003 forward progress 16/16 trajectories
