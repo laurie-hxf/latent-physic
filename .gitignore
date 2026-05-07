@@ -1,2 +1,9 @@
 .pip-cache
 .local
+.cache
+.secrets
+.venv
+*.log
+output/
+outputs/
+wandb/

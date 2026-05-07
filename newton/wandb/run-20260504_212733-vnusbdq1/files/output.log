@@ -1,5 +1,0 @@
-W&B enabled | project=newton-contact-point-friction-fit | run=mujoco-fit-003 | mode=online
-Module __main__ ac6d493 load on device 'cuda:0' took 1.06 ms  (cached)
-Module newton_surface_points_diff_demo fa0f567 load on device 'cuda:0' took 0.83 ms  (cached)
-Module newton._src.solvers.xpbd.kernels e0894c1 load on device 'cuda:0' took 6.79 ms  (cached)
-Module newton._src.solvers.solver 2c8892b load on device 'cuda:0' took 0.58 ms  (cached)
