@@ -51,6 +51,9 @@ class DiffScene:
     contacts: newton.Contacts
     solver: newton.solvers.SolverXPBD
     box_body: int
+    box_body_ids_np: np.ndarray
+    box_body_ids_wp: wp.array
+    batch_capacity: int
     box_mass: float
     floor_top_z: float
     box_center: np.ndarray
@@ -257,6 +260,7 @@ def build_diff_scene(args: argparse.Namespace) -> DiffScene:
 
     floor_half_extents = np.asarray(args.floor_half_extents, dtype=np.float32)
     box_half_extents = np.asarray(args.box_half_extents, dtype=np.float32)
+    batch_capacity = max(int(getattr(args, "batch_capacity", 1)), 1)
     floor_center = np.asarray([0.0, 0.0, -float(floor_half_extents[2])], dtype=np.float32)
     if args.box_start_pos is None:
         box_center = np.asarray([0.0, 0.0, float(box_half_extents[2])], dtype=np.float32)
@@ -272,44 +276,56 @@ def build_diff_scene(args: argparse.Namespace) -> DiffScene:
 
     builder = newton.ModelBuilder(gravity=-GRAVITY_MAGNITUDE)
 
-    floor_body = builder.add_body(xform=make_transform(floor_center), is_kinematic=True, label="floor")
-    builder.add_shape_box(
-        body=floor_body,
-        hx=float(floor_half_extents[0]),
-        hy=float(floor_half_extents[1]),
-        hz=float(floor_half_extents[2]),
-        cfg=_shape_cfg(
-            density=1.0,
-            friction=float(args.contact_friction),
-            contact_stiffness=float(args.contact_stiffness),
-            contact_damping=float(args.contact_damping),
-            contact_margin=float(args.contact_margin),
-        ),
-        label="floor_box",
-    )
+    floor_body = -1
+    box_body_ids: list[int] = []
+    for world_idx in range(batch_capacity):
+        builder.begin_world(label=f"trajectory_{world_idx}")
+        world_floor_body = builder.add_body(xform=make_transform(floor_center), is_kinematic=True, label=f"floor_{world_idx}")
+        builder.add_shape_box(
+            body=world_floor_body,
+            hx=float(floor_half_extents[0]),
+            hy=float(floor_half_extents[1]),
+            hz=float(floor_half_extents[2]),
+            cfg=_shape_cfg(
+                density=1.0,
+                friction=float(args.contact_friction),
+                contact_stiffness=float(args.contact_stiffness),
+                contact_damping=float(args.contact_damping),
+                contact_margin=float(args.contact_margin),
+            ),
+            label=f"floor_box_{world_idx}",
+        )
 
-    box_body = builder.add_body(
-        xform=make_transform(box_center),
-        mass=total_mass,
-        com=wp.vec3(float(local_com[0]), float(local_com[1]), float(local_com[2])),
-        inertia=wp.mat33(inertia),
-        lock_inertia=True,
-        label="box",
-    )
-    builder.add_shape_box(
-        body=box_body,
-        hx=float(box_half_extents[0]),
-        hy=float(box_half_extents[1]),
-        hz=float(box_half_extents[2]),
-        cfg=_shape_cfg(
-            density=1.0,
-            friction=float(args.contact_friction),
-            contact_stiffness=float(args.contact_stiffness),
-            contact_damping=float(args.contact_damping),
-            contact_margin=float(args.contact_margin),
-        ),
-        label="box_box",
-    )
+        world_box_body = builder.add_body(
+            xform=make_transform(box_center),
+            mass=total_mass,
+            com=wp.vec3(float(local_com[0]), float(local_com[1]), float(local_com[2])),
+            inertia=wp.mat33(inertia),
+            lock_inertia=True,
+            label=f"box_{world_idx}",
+        )
+        builder.add_shape_box(
+            body=world_box_body,
+            hx=float(box_half_extents[0]),
+            hy=float(box_half_extents[1]),
+            hz=float(box_half_extents[2]),
+            cfg=_shape_cfg(
+                density=1.0,
+                friction=float(args.contact_friction),
+                contact_stiffness=float(args.contact_stiffness),
+                contact_damping=float(args.contact_damping),
+                contact_margin=float(args.contact_margin),
+            ),
+            label=f"box_box_{world_idx}",
+        )
+        builder.end_world()
+
+        if world_idx == 0:
+            floor_body = world_floor_body
+        box_body_ids.append(world_box_body)
+
+    box_body_ids_np = np.asarray(box_body_ids, dtype=np.int32)
+    box_body = int(box_body_ids_np[0])
 
     model = builder.finalize(device=warp_device, requires_grad=True)
     states = [model.state() for _ in range(max(int(args.steps), 0) + 1)]
@@ -389,6 +405,9 @@ def build_diff_scene(args: argparse.Namespace) -> DiffScene:
         contacts=contacts,
         solver=solver,
         box_body=box_body,
+        box_body_ids_np=box_body_ids_np,
+        box_body_ids_wp=wp.array(box_body_ids_np, dtype=wp.int32, device=warp_device),
+        batch_capacity=batch_capacity,
         box_mass=float(total_mass),
         floor_top_z=float(floor_center[2] + floor_half_extents[2]),
         box_center=box_center,

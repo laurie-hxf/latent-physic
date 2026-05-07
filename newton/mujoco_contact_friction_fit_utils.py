@@ -76,6 +76,33 @@ class OptimizationBuffers:
     inactive_point_friction_np: np.ndarray
 
 
+@dataclass
+class BatchedOptimizationBuffers:
+    batch_size: int
+    max_steps: int
+    max_frames: int
+    active_point_friction: wp.array
+    active_indices: wp.array
+    full_point_friction: wp.array
+    contact_weighted_masses: wp.array
+    contact_weighted_mass_total: wp.array
+    step_forces: wp.array
+    step_application_points: wp.array
+    target_positions: wp.array
+    target_quaternions: wp.array
+    target_linear_velocity: wp.array
+    target_angular_velocity: wp.array
+    trajectory_step_counts: wp.array
+    frame_scales: wp.array
+    loss: wp.array
+    position_loss: wp.array
+    orientation_loss: wp.array
+    linear_velocity_loss: wp.array
+    angular_velocity_loss: wp.array
+    batch_loss: wp.array
+    inactive_point_friction_np: np.ndarray
+
+
 def quat_wxyz_to_xyzw(quaternions_wxyz: np.ndarray) -> np.ndarray:
     quaternions_xyzw = np.concatenate([quaternions_wxyz[:, 1:4], quaternions_wxyz[:, 0:1]], axis=1)
     norms = np.linalg.norm(quaternions_xyzw, axis=1, keepdims=True)
@@ -331,10 +358,15 @@ def run_adam_update(
     min_value: float,
     max_value: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    first_moment = beta1 * first_moment + (1.0 - beta1) * grads
-    second_moment = beta2 * second_moment + (1.0 - beta2) * (grads * grads)
-    first_hat = first_moment / (1.0 - beta1**step)
-    second_hat = second_moment / (1.0 - beta2**step)
-    params = params - learning_rate * first_hat / (np.sqrt(second_hat) + eps)
-    params = np.clip(params, min_value, max_value)
-    return params.astype(np.float32), first_moment, second_moment
+    params64 = np.asarray(params, dtype=np.float64)
+    grads64 = np.asarray(grads, dtype=np.float64)
+    first_moment64 = np.asarray(first_moment, dtype=np.float64)
+    second_moment64 = np.asarray(second_moment, dtype=np.float64)
+
+    first_moment64 = beta1 * first_moment64 + (1.0 - beta1) * grads64
+    second_moment64 = beta2 * second_moment64 + (1.0 - beta2) * (grads64 * grads64)
+    first_hat = first_moment64 / (1.0 - beta1**step)
+    second_hat = second_moment64 / (1.0 - beta2**step)
+    params64 = params64 - learning_rate * first_hat / (np.sqrt(second_hat) + eps)
+    params64 = np.clip(params64, min_value, max_value)
+    return params64.astype(np.float32), first_moment64, second_moment64
