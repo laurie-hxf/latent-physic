@@ -7,9 +7,6 @@ import numpy as np
 import warp as wp
 
 from mujoco_contact_friction_fit_utils import (
-    MujocoTrajectory,
-    MujocoTrajectoryCollection,
-    OptimizationBuffers,
     compute_active_contact_point_indices,
     load_mujoco_trajectories,
 )
@@ -17,6 +14,7 @@ from mujoco_contact_friction_fit_wandb import build_wandb_log_payload, init_wand
 from fit_mujoco_contact_point_friction_io import (
     DEFAULT_TRAIN_BATCH_SIZE,
     parse_args,
+    save_contact_friction_heatmap,
 )
 from fit_mujoco_contact_point_friction_output import export_contact_friction_outputs
 from fit_mujoco_contact_point_friction_runtime import (
@@ -37,6 +35,84 @@ from newton_surface_points_diff_demo import (
 )
 
 
+def save_training_checkpoint(
+    *,
+    checkpoint_path,
+    iteration: int,
+    active_indices: np.ndarray,
+    active_params: np.ndarray,
+    adam_m: np.ndarray,
+    adam_v: np.ndarray,
+    best_loss: float,
+    best_active_params: np.ndarray,
+    loss_history: list[float],
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        checkpoint_path,
+        iteration=np.asarray(iteration, dtype=np.int32),
+        active_indices=np.asarray(active_indices, dtype=np.int32),
+        active_params=np.asarray(active_params, dtype=np.float32),
+        adam_m=np.asarray(adam_m, dtype=np.float64),
+        adam_v=np.asarray(adam_v, dtype=np.float64),
+        best_loss=np.asarray(best_loss, dtype=np.float64),
+        best_active_params=np.asarray(best_active_params, dtype=np.float32),
+        loss_history=np.asarray(loss_history, dtype=np.float32),
+        rng_state=np.asarray(rng.bit_generator.state, dtype=object),
+        trajectory_npz_path=np.asarray(str(args.trajectory_npz.resolve())),
+        max_steps=np.asarray(-1 if args.max_steps is None else int(args.max_steps), dtype=np.int32),
+        max_trajectories=np.asarray(-1 if args.max_trajectories is None else int(args.max_trajectories), dtype=np.int32),
+    )
+
+
+def resolve_checkpoint_heatmap_path(args: argparse.Namespace, iteration: int):
+    if args.checkpoint_heatmap_dir is None:
+        heatmap_dir = args.checkpoint_path.parent / f"{args.checkpoint_path.stem}_heatmaps"
+    else:
+        heatmap_dir = args.checkpoint_heatmap_dir
+    return heatmap_dir / f"iter_{int(iteration):06d}.png"
+
+
+def load_training_checkpoint(
+    *,
+    checkpoint_path,
+    active_indices: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, list[float]]:
+    with np.load(checkpoint_path, allow_pickle=True) as data:
+        checkpoint_active_indices = np.asarray(data["active_indices"], dtype=np.int32)
+        if checkpoint_active_indices.shape != active_indices.shape or not np.array_equal(checkpoint_active_indices, active_indices):
+            raise ValueError(
+                f"{checkpoint_path} active point indices do not match the current run. "
+                "Use matching trajectory/model/contact-mask settings or start without --resume-checkpoint."
+            )
+
+        iteration = int(np.asarray(data["iteration"]).item())
+        active_params = np.asarray(data["active_params"], dtype=np.float32)
+        adam_m = np.asarray(data["adam_m"], dtype=np.float64)
+        adam_v = np.asarray(data["adam_v"], dtype=np.float64)
+        best_loss = float(np.asarray(data["best_loss"]).item())
+        best_active_params = np.asarray(data["best_active_params"], dtype=np.float32)
+        loss_history = [float(value) for value in np.asarray(data["loss_history"], dtype=np.float32)]
+
+        expected_shape = active_indices.shape
+        for name, values in (
+            ("active_params", active_params),
+            ("adam_m", adam_m),
+            ("adam_v", adam_v),
+            ("best_active_params", best_active_params),
+        ):
+            if values.shape != expected_shape:
+                raise ValueError(f"{checkpoint_path} {name} has shape {values.shape}, expected {expected_shape}")
+
+        rng_state = data["rng_state"].item()
+        rng.bit_generator.state = rng_state
+
+    return iteration, active_params, adam_m, adam_v, best_loss, best_active_params, loss_history
+
+
 @wp.kernel
 def scatter_active_point_friction_kernel(
     active_indices: wp.array(dtype=wp.int32),
@@ -48,126 +124,11 @@ def scatter_active_point_friction_kernel(
     full_point_friction[point_idx] = active_point_friction[tid]
 
 
-@wp.kernel
-def apply_external_and_surface_point_forces_trajectory_kernel(
-    step_idx: int,
-    body_id: int,
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    body_com: wp.array(dtype=wp.vec3),
-    local_surface_points: wp.array(dtype=wp.vec3),
-    weighted_masses: wp.array(dtype=float),
-    total_weighted_mass: wp.array(dtype=float),
-    point_friction: wp.array(dtype=float),
-    step_forces: wp.array(dtype=wp.vec3),
-    step_application_points: wp.array(dtype=wp.vec3),
-    total_mass: float,
-    gravity_magnitude: float,
-    floor_top_z: float,
-    contact_stiffness: float,
-    contact_damping: float,
-    contact_band: float,
-    friction_regularization: float,
-    body_f: wp.array(dtype=wp.spatial_vector),
-):
-    tid = wp.tid()
-    pose = body_q[body_id]
-    qd = body_qd[body_id]
-    world_com = wp.transform_point(pose, body_com[body_id])
-
-    if tid == 0:
-        external_force = step_forces[step_idx]
-        application_point = step_application_points[step_idx]
-        external_moment_arm = application_point - world_com
-        external_torque = wp.cross(external_moment_arm, external_force)
-        wp.atomic_add(body_f, body_id, wp.spatial_vector(external_force, external_torque))
-
-    total_weight = total_weighted_mass[0]
-    if total_weight <= 1.0e-8:
-        return
-
-    world_point = wp.transform_point(pose, local_surface_points[tid])
-    moment_arm = world_point - world_com
-
-    linear_velocity = wp.spatial_top(qd)
-    angular_velocity = wp.spatial_bottom(qd)
-    point_velocity = linear_velocity + wp.cross(angular_velocity, moment_arm)
-
-    gap = world_point[2] - floor_top_z
-    penetration = wp.max(-gap, 0.0)
-    safe_band = wp.max(contact_band, 1.0e-6)
-    activation = _smoothstep01((contact_band - gap) / safe_band)
-    mass_fraction = weighted_masses[tid] / total_weight
-
-    external_force = step_forces[step_idx]
-    normal_load_total = wp.max(0.0, total_mass * gravity_magnitude - external_force[2])
-    support_force_z = mass_fraction * normal_load_total
-    penalty_force_z = mass_fraction * activation * (
-        contact_stiffness * penetration + contact_damping * wp.max(-point_velocity[2], 0.0)
-    )
-    normal_force = wp.vec3(0.0, 0.0, support_force_z + penalty_force_z)
-    tangential_velocity = wp.vec3(point_velocity[0], point_velocity[1], 0.0)
-    tangential_speed = wp.sqrt(
-        wp.dot(tangential_velocity, tangential_velocity) + friction_regularization * friction_regularization
-    )
-    normal_load = mass_fraction * normal_load_total
-    mu = wp.max(point_friction[tid], 0.0)
-    friction_force = -mu * normal_load * (tangential_velocity / tangential_speed)
-    total_force = normal_force + friction_force
-    total_torque = wp.cross(moment_arm, total_force)
-    wp.atomic_add(body_f, body_id, wp.spatial_vector(total_force, total_torque))
-
-
-@wp.kernel
-def accumulate_frame_loss_kernel(
-    body_id: int,
-    frame_idx: int,
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    target_positions: wp.array(dtype=wp.vec3),
-    target_quaternions: wp.array(dtype=wp.vec4),
-    target_linear_velocity: wp.array(dtype=wp.vec3),
-    target_angular_velocity: wp.array(dtype=wp.vec3),
-    frame_scale: float,
-    position_loss: wp.array(dtype=float),
-    orientation_loss: wp.array(dtype=float),
-    linear_velocity_loss: wp.array(dtype=float),
-    angular_velocity_loss: wp.array(dtype=float),
-    accumulate_velocity_loss: int,
-):
-    pose = body_q[body_id]
-    world_position = wp.transform_get_translation(pose)
-    target_position = target_positions[frame_idx]
-    position_delta = world_position - target_position
-    position_loss_value = wp.dot(position_delta, position_delta)
-
-    quat = wp.transform_get_rotation(pose)
-    target_quat = target_quaternions[frame_idx]
-    dot_q = quat[0] * target_quat[0] + quat[1] * target_quat[1] + quat[2] * target_quat[2] + quat[3] * target_quat[3]
-    sign = 1.0
-    if dot_q < 0.0:
-        sign = -1.0
-    quat_dx = sign * quat[0] - target_quat[0]
-    quat_dy = sign * quat[1] - target_quat[1]
-    quat_dz = sign * quat[2] - target_quat[2]
-    quat_dw = sign * quat[3] - target_quat[3]
-    orientation_loss_value = quat_dx * quat_dx + quat_dy * quat_dy + quat_dz * quat_dz + quat_dw * quat_dw
-
-    wp.atomic_add(position_loss, 0, frame_scale * position_loss_value)
-    wp.atomic_add(orientation_loss, 0, frame_scale * orientation_loss_value)
-
-    if accumulate_velocity_loss != 0:
-        spatial_velocity = body_qd[body_id]
-        linear_velocity = wp.spatial_top(spatial_velocity)
-        angular_velocity = wp.spatial_bottom(spatial_velocity)
-
-        linear_delta = linear_velocity - target_linear_velocity[frame_idx]
-        angular_delta = angular_velocity - target_angular_velocity[frame_idx]
-        linear_loss_value = wp.dot(linear_delta, linear_delta)
-        angular_loss_value = wp.dot(angular_delta, angular_delta)
-
-        wp.atomic_add(linear_velocity_loss, 0, frame_scale * linear_loss_value)
-        wp.atomic_add(angular_velocity_loss, 0, frame_scale * angular_loss_value)
+@wp.func
+def rotate_point_by_quat_xyzw(quat: wp.vec4, point: wp.vec3) -> wp.vec3:
+    quat_xyz = wp.vec3(quat[0], quat[1], quat[2])
+    twice_cross = 2.0 * wp.cross(quat_xyz, point)
+    return point + quat[3] * twice_cross + wp.cross(quat_xyz, twice_cross)
 
 
 @wp.kernel
@@ -282,12 +243,15 @@ def accumulate_batched_frame_loss_kernel(
     box_body_ids: wp.array(dtype=wp.int32),
     body_q: wp.array(dtype=wp.transform),
     body_qd: wp.array(dtype=wp.spatial_vector),
+    local_surface_points: wp.array(dtype=wp.vec3),
     target_positions: wp.array(dtype=wp.vec3),
     target_quaternions: wp.array(dtype=wp.vec4),
     target_linear_velocity: wp.array(dtype=wp.vec3),
     target_angular_velocity: wp.array(dtype=wp.vec3),
     trajectory_step_counts: wp.array(dtype=wp.int32),
     frame_scales: wp.array(dtype=float),
+    point_scale: float,
+    point_count: int,
     max_frames: int,
     position_loss: wp.array(dtype=float),
     orientation_loss: wp.array(dtype=float),
@@ -295,7 +259,9 @@ def accumulate_batched_frame_loss_kernel(
     angular_velocity_loss: wp.array(dtype=float),
     accumulate_velocity_loss: int,
 ):
-    batch_idx = wp.tid()
+    tid = wp.tid()
+    batch_idx = tid // point_count
+    point_idx = tid - batch_idx * point_count
     if frame_idx > trajectory_step_counts[batch_idx]:
         return
 
@@ -304,13 +270,19 @@ def accumulate_batched_frame_loss_kernel(
     frame_scale = frame_scales[batch_idx]
 
     pose = body_q[body_id]
-    world_position = wp.transform_get_translation(pose)
+    local_point = local_surface_points[point_idx]
+    world_position = wp.transform_point(pose, local_point)
     target_position = target_positions[target_offset]
-    position_delta = world_position - target_position
+    target_quat = target_quaternions[target_offset]
+    target_point_position = rotate_point_by_quat_xyzw(target_quat, local_point) + target_position
+    position_delta = world_position - target_point_position
     position_loss_value = wp.dot(position_delta, position_delta)
+    wp.atomic_add(position_loss, batch_idx, frame_scale * point_scale * position_loss_value)
+
+    if point_idx != 0:
+        return
 
     quat = wp.transform_get_rotation(pose)
-    target_quat = target_quaternions[target_offset]
     dot_q = quat[0] * target_quat[0] + quat[1] * target_quat[1] + quat[2] * target_quat[2] + quat[3] * target_quat[3]
     sign = 1.0
     if dot_q < 0.0:
@@ -321,7 +293,6 @@ def accumulate_batched_frame_loss_kernel(
     quat_dw = sign * quat[3] - target_quat[3]
     orientation_loss_value = quat_dx * quat_dx + quat_dy * quat_dy + quat_dz * quat_dz + quat_dw * quat_dw
 
-    wp.atomic_add(position_loss, batch_idx, frame_scale * position_loss_value)
     wp.atomic_add(orientation_loss, batch_idx, frame_scale * orientation_loss_value)
 
     if accumulate_velocity_loss != 0:
@@ -370,26 +341,6 @@ def sum_batched_losses_kernel(
 
 
 @wp.kernel
-def combine_loss_components_kernel(
-    position_loss: wp.array(dtype=float),
-    orientation_loss: wp.array(dtype=float),
-    linear_velocity_loss: wp.array(dtype=float),
-    angular_velocity_loss: wp.array(dtype=float),
-    position_weight: float,
-    orientation_weight: float,
-    linear_velocity_weight: float,
-    angular_velocity_weight: float,
-    loss: wp.array(dtype=float),
-):
-    loss[0] = (
-        position_weight * position_loss[0]
-        + orientation_weight * orientation_loss[0]
-        + linear_velocity_weight * linear_velocity_loss[0]
-        + angular_velocity_weight * angular_velocity_loss[0]
-    )
-
-
-@wp.kernel
 def adam_update_kernel(
     params: wp.array(dtype=float),
     grads: wp.array(dtype=wp.float64),
@@ -418,15 +369,6 @@ def adam_update_kernel(
 
 
 @wp.kernel
-def add_scaled_scalar_kernel(
-    src: wp.array(dtype=float),
-    scale: float,
-    dst: wp.array(dtype=float),
-):
-    wp.atomic_add(dst, 0, scale * src[0])
-
-
-@wp.kernel
 def flag_nonfinite_array_at_index_kernel(
     values: wp.array(dtype=float),
     nonfinite_flags: wp.array(dtype=wp.int32),
@@ -448,29 +390,6 @@ def add_float32_array_to_float64_if_unflagged_kernel(
     tid = wp.tid()
     if nonfinite_flags[flag_index] == 0:
         dst[tid] = dst[tid] + wp.float64(src[tid])
-
-
-@wp.kernel
-def accumulate_scalar_metrics_if_unflagged_kernel(
-    nonfinite_flags: wp.array(dtype=wp.int32),
-    flag_index: int,
-    loss: wp.array(dtype=float),
-    position_loss: wp.array(dtype=float),
-    orientation_loss: wp.array(dtype=float),
-    linear_velocity_loss: wp.array(dtype=float),
-    angular_velocity_loss: wp.array(dtype=float),
-    totals: wp.array(dtype=wp.float64),
-    good_count: wp.array(dtype=wp.int32),
-):
-    if nonfinite_flags[flag_index] != 0:
-        return
-
-    wp.atomic_add(totals, 0, wp.float64(loss[0]))
-    wp.atomic_add(totals, 1, wp.float64(position_loss[0]))
-    wp.atomic_add(totals, 2, wp.float64(orientation_loss[0]))
-    wp.atomic_add(totals, 3, wp.float64(linear_velocity_loss[0]))
-    wp.atomic_add(totals, 4, wp.float64(angular_velocity_loss[0]))
-    wp.atomic_add(good_count, 0, 1)
 
 
 def main() -> None:
@@ -541,8 +460,31 @@ def main() -> None:
     best_loss = float("inf")
     best_active_params = active_params_np.copy()
     rng = np.random.default_rng(int(args.seed))
+    start_iteration = 1
+    if args.resume_checkpoint is not None:
+        (
+            resume_iteration,
+            active_params_np,
+            adam_m_np,
+            adam_v_np,
+            best_loss,
+            best_active_params,
+            loss_history,
+        ) = load_training_checkpoint(
+            checkpoint_path=args.resume_checkpoint,
+            active_indices=active_indices,
+            rng=rng,
+        )
+        active_params.assign(active_params_np)
+        adam_m.assign(adam_m_np)
+        adam_v.assign(adam_v_np)
+        start_iteration = resume_iteration + 1
+        log_message(
+            f"resumed checkpoint {args.resume_checkpoint.resolve()} "
+            f"at iteration={resume_iteration} best_loss={best_loss:.6f}"
+        )
     try:
-        for iteration in range(1, max(int(args.opt_iters), 0) + 1):
+        for iteration in range(start_iteration, max(int(args.opt_iters), 0) + 1):
             iteration_start = time.time()
             batch_indices = sample_training_batch_indices(len(trajectories), batch_size, rng)
             batch_trajectories = [trajectories[int(idx)] for idx in batch_indices]
@@ -592,10 +534,14 @@ def main() -> None:
 
             good_buffer_count = len(batch_trajectories)
             loss_value = float(np.mean(buffers.loss.numpy()))
-            position_loss_value = float(np.mean(buffers.position_loss.numpy()))
-            orientation_loss_value = float(np.mean(buffers.orientation_loss.numpy()))
-            linear_velocity_loss_value = float(np.mean(buffers.linear_velocity_loss.numpy()))
-            angular_velocity_loss_value = float(np.mean(buffers.angular_velocity_loss.numpy()))
+            raw_position_loss_value = float(np.mean(buffers.position_loss.numpy()))
+            raw_orientation_loss_value = float(np.mean(buffers.orientation_loss.numpy()))
+            raw_linear_velocity_loss_value = float(np.mean(buffers.linear_velocity_loss.numpy()))
+            raw_angular_velocity_loss_value = float(np.mean(buffers.angular_velocity_loss.numpy()))
+            position_loss_value = float(args.position_loss_weight) * raw_position_loss_value
+            orientation_loss_value = float(args.orientation_loss_weight) * raw_orientation_loss_value
+            linear_velocity_loss_value = float(args.linear_velocity_loss_weight) * raw_linear_velocity_loss_value
+            angular_velocity_loss_value = float(args.angular_velocity_loss_weight) * raw_angular_velocity_loss_value
             grad_value = grad_value_total_wp.numpy()
             assert_array_finite(
                 "batch grad_value_total",
@@ -650,6 +596,30 @@ def main() -> None:
                 best_loss = loss_value
                 best_active_params = active_params_np.copy()
 
+            checkpoint_every = int(args.checkpoint_every)
+            if checkpoint_every > 0 and (iteration % checkpoint_every == 0 or iteration == int(args.opt_iters)):
+                save_training_checkpoint(
+                    checkpoint_path=args.checkpoint_path,
+                    iteration=iteration,
+                    active_indices=active_indices,
+                    active_params=active_params_np,
+                    adam_m=adam_m_np,
+                    adam_v=adam_v_np,
+                    best_loss=best_loss,
+                    best_active_params=best_active_params,
+                    loss_history=loss_history,
+                    rng=rng,
+                    args=args,
+                )
+                checkpoint_heatmap_path = resolve_checkpoint_heatmap_path(args, iteration)
+                save_contact_friction_heatmap(
+                    local_surface_points=diff_scene.local_surface_points_np,
+                    active_indices=active_indices,
+                    active_point_friction=active_params_np,
+                    output_path=checkpoint_heatmap_path,
+                )
+                log_message(f"checkpoint_heatmap_written_to={checkpoint_heatmap_path.resolve()}")
+
             if wandb_run is not None:
                 log_payload = build_wandb_log_payload(
                     loss_value=loss_value,
@@ -657,6 +627,10 @@ def main() -> None:
                     orientation_loss_value=orientation_loss_value,
                     linear_velocity_loss_value=linear_velocity_loss_value,
                     angular_velocity_loss_value=angular_velocity_loss_value,
+                    raw_position_loss_value=raw_position_loss_value,
+                    raw_orientation_loss_value=raw_orientation_loss_value,
+                    raw_linear_velocity_loss_value=raw_linear_velocity_loss_value,
+                    raw_angular_velocity_loss_value=raw_angular_velocity_loss_value,
                     grad_value=grad_value,
                     active_params=active_params_np,
                     active_indices=active_indices,
@@ -695,13 +669,17 @@ def main() -> None:
             combine_batched_loss_components_kernel=combine_batched_loss_components_kernel,
             sum_batched_losses_kernel=sum_batched_losses_kernel,
         )
+        final_position_loss_contribution = float(args.position_loss_weight) * final_position_loss
+        final_orientation_loss_contribution = float(args.orientation_loss_weight) * final_orientation_loss
+        final_linear_velocity_loss_contribution = float(args.linear_velocity_loss_weight) * final_linear_velocity_loss
+        final_angular_velocity_loss_contribution = float(args.angular_velocity_loss_weight) * final_angular_velocity_loss
 
         assert_array_finite(
             "best_active_params",
             best_active_params,
             context="final export",
         )
-        learned_point_friction = export_contact_friction_outputs(
+        export_contact_friction_outputs(
             args=args,
             trajectory_collection=trajectory_collection,
             representative_trajectory=representative_trajectory,
@@ -723,10 +701,14 @@ def main() -> None:
             wandb_run.summary["surface_points"] = int(len(diff_scene.local_surface_points_np))
             wandb_run.summary["active_contact_points"] = int(len(active_indices))
             wandb_run.summary["final_loss"] = float(final_loss)
-            wandb_run.summary["final_position_loss"] = float(final_position_loss)
-            wandb_run.summary["final_orientation_loss"] = float(final_orientation_loss)
-            wandb_run.summary["final_linear_velocity_loss"] = float(final_linear_velocity_loss)
-            wandb_run.summary["final_angular_velocity_loss"] = float(final_angular_velocity_loss)
+            wandb_run.summary["final_position_loss"] = float(final_position_loss_contribution)
+            wandb_run.summary["final_orientation_loss"] = float(final_orientation_loss_contribution)
+            wandb_run.summary["final_linear_velocity_loss"] = float(final_linear_velocity_loss_contribution)
+            wandb_run.summary["final_angular_velocity_loss"] = float(final_angular_velocity_loss_contribution)
+            wandb_run.summary["final_raw_position_loss"] = float(final_position_loss)
+            wandb_run.summary["final_raw_orientation_loss"] = float(final_orientation_loss)
+            wandb_run.summary["final_raw_linear_velocity_loss"] = float(final_linear_velocity_loss)
+            wandb_run.summary["final_raw_angular_velocity_loss"] = float(final_angular_velocity_loss)
             wandb_run.summary["mu_mean"] = float(best_active_params.mean())
             wandb_run.summary["mu_std"] = float(best_active_params.std())
             wandb_run.summary["mu_min"] = float(best_active_params.min())
@@ -742,10 +724,10 @@ def main() -> None:
         log_message(f"max_steps={trajectory_collection.max_steps} dt={representative_trajectory.timestep:.6f}")
         log_message(f"surface_points={len(diff_scene.local_surface_points_np)} active_contact_points={len(active_indices)}")
         log_message(f"final_loss={final_loss:.6f}")
-        log_message(f"final_position_loss={final_position_loss:.6f}")
-        log_message(f"final_orientation_loss={final_orientation_loss:.6f}")
-        log_message(f"final_linear_velocity_loss={final_linear_velocity_loss:.6f}")
-        log_message(f"final_angular_velocity_loss={final_angular_velocity_loss:.6f}")
+        log_message(f"final_position_loss={final_position_loss_contribution:.6f}")
+        log_message(f"final_orientation_loss={final_orientation_loss_contribution:.6f}")
+        log_message(f"final_linear_velocity_loss={final_linear_velocity_loss_contribution:.6f}")
+        log_message(f"final_angular_velocity_loss={final_angular_velocity_loss_contribution:.6f}")
         log_message(f"results_written_to={args.results_path.resolve()}")
         log_message(f"heatmap_written_to={args.heatmap_path.resolve()}")
         if args.scene_usd_path is not None:

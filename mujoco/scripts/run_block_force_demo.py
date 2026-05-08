@@ -8,19 +8,35 @@ import sys
 import time
 from pathlib import Path
 
-import imageio.v3 as iio
 import mujoco
 import numpy as np
+
+try:
+    import imageio.v3 as iio
+except ModuleNotFoundError:
+    iio = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENE_PATH = ROOT / "third_party" / "mujoco_menagerie" / "franka_emika_panda" / "block_force_scene.xml"
 
 BLOCK_BODY_NAME = "push_block"
+FLOOR_GEOM_NAME = "floor"
 REST_LINEAR_THRESHOLD = 1e-3
 REST_ANGULAR_THRESHOLD = 1e-3
 REST_HOLD_TIME = 0.2
 SURFACE_EPS = 1e-6
+DEFAULT_VIDEO_FRAME_STRIDE = 3
+DEFAULT_INIT_X_RANGE = (0.45, 0.70)
+DEFAULT_INIT_Y_RANGE = (-0.12, 0.12)
+CONTACT_FACE_NORMALS = (
+    ("x_neg", np.array([-1.0, 0.0, 0.0], dtype=np.float64)),
+    ("x_pos", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
+    ("y_neg", np.array([0.0, -1.0, 0.0], dtype=np.float64)),
+    ("y_pos", np.array([0.0, 1.0, 0.0], dtype=np.float64)),
+    ("z_neg", np.array([0.0, 0.0, -1.0], dtype=np.float64)),
+    ("z_pos", np.array([0.0, 0.0, 1.0], dtype=np.float64)),
+)
 TRAJECTORY_COLUMNS = [
     "time",
     "pos_x",
@@ -49,6 +65,23 @@ def block_body_id(model: mujoco.MjModel) -> int:
     return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, BLOCK_BODY_NAME)
 
 
+def floor_z(model: mujoco.MjModel) -> float:
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, FLOOR_GEOM_NAME)
+    if geom_id < 0:
+        return 0.0
+    return float(model.geom_pos[geom_id][2])
+
+
+def block_freejoint_addresses(model: mujoco.MjModel) -> tuple[int, int]:
+    body_id = block_body_id(model)
+    joint_start = int(model.body_jntadr[body_id])
+    joint_count = int(model.body_jntnum[body_id])
+    for joint_id in range(joint_start, joint_start + joint_count):
+        if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+            return int(model.jnt_qposadr[joint_id]), int(model.jnt_dofadr[joint_id])
+    raise ValueError(f"Body '{BLOCK_BODY_NAME}' does not have a freejoint.")
+
+
 def body_position(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) -> np.ndarray:
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
     return data.xpos[body_id].copy()
@@ -59,18 +92,248 @@ def reset_scene(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     mujoco.mj_forward(model, data)
 
 
+def normalize_vector(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-12:
+        raise ValueError("Cannot normalize a near-zero vector.")
+    return np.asarray(vector, dtype=np.float64) / norm
+
+
+def skew_matrix(vector: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(vector, dtype=np.float64)
+    return np.array(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    source_unit = normalize_vector(source)
+    target_unit = normalize_vector(target)
+    dot = float(np.clip(np.dot(source_unit, target_unit), -1.0, 1.0))
+    if dot > 1.0 - 1e-10:
+        return np.eye(3, dtype=np.float64)
+    if dot < -1.0 + 1e-10:
+        axis = np.cross(source_unit, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+        if np.linalg.norm(axis) < 1e-10:
+            axis = np.cross(source_unit, np.array([0.0, 1.0, 0.0], dtype=np.float64))
+        axis = normalize_vector(axis)
+        axis_cross = skew_matrix(axis)
+        return np.eye(3, dtype=np.float64) + 2.0 * (axis_cross @ axis_cross)
+
+    axis_cross = skew_matrix(np.cross(source_unit, target_unit))
+    return np.eye(3, dtype=np.float64) + axis_cross + axis_cross @ axis_cross * (1.0 / (1.0 + dot))
+
+
+def z_axis_rotation_matrix(angle: float) -> np.ndarray:
+    cosine = float(np.cos(angle))
+    sine = float(np.sin(angle))
+    return np.array(
+        [
+            [cosine, -sine, 0.0],
+            [sine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def quaternion_wxyz_from_matrix(rotation: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(rotation, dtype=np.float64)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = np.sqrt(trace + 1.0) * 2.0
+        quat = np.array(
+            [
+                0.25 * scale,
+                (matrix[2, 1] - matrix[1, 2]) / scale,
+                (matrix[0, 2] - matrix[2, 0]) / scale,
+                (matrix[1, 0] - matrix[0, 1]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    else:
+        diagonal_index = int(np.argmax(np.diag(matrix)))
+        if diagonal_index == 0:
+            scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+            quat = np.array(
+                [
+                    (matrix[2, 1] - matrix[1, 2]) / scale,
+                    0.25 * scale,
+                    (matrix[0, 1] + matrix[1, 0]) / scale,
+                    (matrix[0, 2] + matrix[2, 0]) / scale,
+                ],
+                dtype=np.float64,
+            )
+        elif diagonal_index == 1:
+            scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+            quat = np.array(
+                [
+                    (matrix[0, 2] - matrix[2, 0]) / scale,
+                    (matrix[0, 1] + matrix[1, 0]) / scale,
+                    0.25 * scale,
+                    (matrix[1, 2] + matrix[2, 1]) / scale,
+                ],
+                dtype=np.float64,
+            )
+        else:
+            scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+            quat = np.array(
+                [
+                    (matrix[1, 0] - matrix[0, 1]) / scale,
+                    (matrix[0, 2] + matrix[2, 0]) / scale,
+                    (matrix[1, 2] + matrix[2, 1]) / scale,
+                    0.25 * scale,
+                ],
+                dtype=np.float64,
+            )
+    return normalize_vector(quat)
+
+
+def block_local_corners(bounds_min: np.ndarray, bounds_max: np.ndarray) -> np.ndarray:
+    return np.array(
+        [
+            [x, y, z]
+            for x in (bounds_min[0], bounds_max[0])
+            for y in (bounds_min[1], bounds_max[1])
+            for z in (bounds_min[2], bounds_max[2])
+        ],
+        dtype=np.float64,
+    )
+
+
+def set_block_freejoint_pose(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    position: np.ndarray,
+    quaternion_wxyz: np.ndarray,
+) -> None:
+    qpos_address, dof_address = block_freejoint_addresses(model)
+    data.qpos[qpos_address : qpos_address + 3] = np.asarray(position, dtype=np.float64)
+    data.qpos[qpos_address + 3 : qpos_address + 7] = normalize_vector(np.asarray(quaternion_wxyz, dtype=np.float64))
+    data.qvel[dof_address : dof_address + 6] = 0.0
+    data.qacc[dof_address : dof_address + 6] = 0.0
+    data.qfrc_applied[:] = 0.0
+    data.xfrc_applied[:] = 0.0
+    mujoco.mj_forward(model, data)
+
+
+def sample_contact_face_initial_pose(
+    rng: np.random.Generator,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    floor_height: float,
+    clearance: float,
+) -> dict[str, object]:
+    face_id = int(rng.integers(0, len(CONTACT_FACE_NORMALS)))
+    face_name, face_normal = CONTACT_FACE_NORMALS[face_id]
+    face_to_down = rotation_matrix_from_vectors(face_normal, np.array([0.0, 0.0, -1.0], dtype=np.float64))
+    yaw = float(rng.uniform(0.0, 2.0 * np.pi))
+    rotation = z_axis_rotation_matrix(yaw) @ face_to_down
+    quaternion_wxyz = quaternion_wxyz_from_matrix(rotation)
+
+    corners = block_local_corners(bounds_min, bounds_max)
+    min_corner_z = float(np.min(corners @ rotation.T[:, 2]))
+    position = np.array(
+        [
+            float(rng.uniform(x_range[0], x_range[1])),
+            float(rng.uniform(y_range[0], y_range[1])),
+            floor_height + float(clearance) - min_corner_z,
+        ],
+        dtype=np.float64,
+    )
+    return {
+        "position": position,
+        "quaternion_wxyz": quaternion_wxyz,
+        "contact_face_id": face_id,
+        "contact_face_name": face_name,
+        "contact_face_normal_local": face_normal.copy(),
+        "yaw_about_world_z": yaw,
+    }
+
+
+def apply_dataset_initial_pose(
+    args: argparse.Namespace,
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    rng: np.random.Generator,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+) -> dict[str, object]:
+    body_id = block_body_id(model)
+    if not args.randomize_initial_pose:
+        mujoco.mj_forward(model, data)
+        return {
+            "position": data.xpos[body_id].copy(),
+            "quaternion_wxyz": data.xquat[body_id].copy(),
+            "contact_face_id": None,
+            "contact_face_name": "fixed_xml_pose",
+            "contact_face_normal_local": None,
+            "yaw_about_world_z": None,
+        }
+
+    pose = sample_contact_face_initial_pose(
+        rng,
+        bounds_min,
+        bounds_max,
+        (float(args.init_x_min), float(args.init_x_max)),
+        (float(args.init_y_min), float(args.init_y_max)),
+        floor_z(model),
+        float(args.init_clearance),
+    )
+    set_block_freejoint_pose(model, data, pose["position"], pose["quaternion_wxyz"])
+    return pose
+
+
 def capture_frame(
     data: mujoco.MjData,
     frames: list[np.ndarray] | None,
     renderer: mujoco.Renderer | None,
     frame_index: int,
+    frame_stride: int = DEFAULT_VIDEO_FRAME_STRIDE,
 ) -> None:
     if frames is None or renderer is None:
         return
-    if frame_index % 3 != 0:
+    if frame_index % max(int(frame_stride), 1) != 0:
         return
     renderer.update_scene(data)
     frames.append(renderer.render().copy())
+
+
+def write_video(video_path: Path, frames: list[np.ndarray], fps: float) -> None:
+    if not frames:
+        return
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    if iio is not None:
+        iio.imwrite(video_path, np.stack(frames), fps=fps)
+        return
+
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Video export requires either imageio or opencv-python.") from exc
+
+    first_frame = np.asarray(frames[0])
+    height, width = first_frame.shape[:2]
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {video_path}.")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
 
 def block_application_point(model: mujoco.MjModel, data: mujoco.MjData, offset: np.ndarray) -> np.ndarray:
@@ -209,6 +472,7 @@ def simulate_force(
     renderer: mujoco.Renderer | None = None,
     trajectory_rows: list[list[float]] | None = None,
     stop_on_rest: bool = False,
+    video_frame_stride: int = DEFAULT_VIDEO_FRAME_STRIDE,
 ) -> dict[str, object]:
     body_id = block_body_id(model)
     force_steps = int(force_duration / model.opt.timestep)
@@ -249,11 +513,11 @@ def simulate_force(
                     if rest_counter >= rest_steps:
                         trajectory_closed = True
                         if stop_on_rest:
-                            capture_frame(data, frames, renderer, step)
+                            capture_frame(data, frames, renderer, step, video_frame_stride)
                             break
                 else:
                     rest_counter = 0
-        capture_frame(data, frames, renderer, step)
+        capture_frame(data, frames, renderer, step, video_frame_stride)
 
     data.xfrc_applied[body_id] = 0.0
     data.qfrc_applied[:] = 0.0
@@ -282,6 +546,7 @@ def run_headless(
     dataset_path: Path | None,
     metadata_path: Path | None,
     metadata: dict[str, object],
+    video_frame_stride: int,
 ) -> None:
     renderer = mujoco.Renderer(model, height=720, width=960)
     frames: list[np.ndarray] | None = [] if video_path else None
@@ -296,13 +561,14 @@ def run_headless(
         frames=frames,
         renderer=renderer,
         trajectory_rows=trajectory_rows,
+        video_frame_stride=video_frame_stride,
     )
     if video_path and frames:
-        video_path.parent.mkdir(parents=True, exist_ok=True)
         fps = max(1.0, 30.0 * playback_speed)
-        iio.imwrite(video_path, np.stack(frames), fps=fps)
+        write_video(video_path, frames, fps)
         metadata["video_num_frames"] = len(frames)
         metadata["video_fps"] = fps
+        metadata["video_frame_stride"] = int(video_frame_stride)
     if trajectory_path and trajectory_rows is not None:
         write_trajectory_csv(trajectory_path, trajectory_rows)
     if dataset_path and trajectory_rows is not None:
@@ -439,6 +705,21 @@ def write_batched_dataset_npz(
     force_world = np.asarray([episode["applied_force_world"] for episode in episode_metadata], dtype=np.float32)
     direction_unit = np.asarray([episode["direction_unit"] for episode in episode_metadata], dtype=np.float32)
     point_offset_local = np.asarray([episode["point_offset_local"] for episode in episode_metadata], dtype=np.float32)
+    initial_position = np.asarray(
+        [episode["initial_block_position_world"] for episode in episode_metadata],
+        dtype=np.float32,
+    )
+    initial_quaternion = np.asarray(
+        [episode["initial_block_quaternion_world"] for episode in episode_metadata],
+        dtype=np.float32,
+    )
+    initial_contact_face_id = np.asarray(
+        [
+            -1 if episode["initial_contact_face_id"] is None else int(episode["initial_contact_face_id"])
+            for episode in episode_metadata
+        ],
+        dtype=np.int32,
+    )
     force_duration = np.asarray([episode["force_duration"] for episode in episode_metadata], dtype=np.float32)
     final_position = np.asarray([episode["final_block_position_world"] for episode in episode_metadata], dtype=np.float32)
     final_quaternion = np.asarray(
@@ -458,6 +739,9 @@ def write_batched_dataset_npz(
         force_world=force_world,
         direction_unit=direction_unit,
         point_offset_local=point_offset_local,
+        initial_position=initial_position,
+        initial_quaternion=initial_quaternion,
+        initial_contact_face_id=initial_contact_face_id,
         force_duration=force_duration,
         final_position=final_position,
         final_quaternion=final_quaternion,
@@ -478,20 +762,24 @@ def generate_dataset(
     rng = np.random.default_rng(args.seed)
     bounds_min, bounds_max = block_local_bounds(model)
     preview_dir = args.preview_dir
-    renderer = mujoco.Renderer(model, height=720, width=960) if args.preview_episodes > 0 else None
+    video_dir = args.episode_video_dir
+    save_any_video = bool(args.save_episode_videos or args.preview_episodes > 0)
+    renderer = mujoco.Renderer(model, height=720, width=960) if save_any_video else None
     trajectories: list[np.ndarray] = []
     episode_metadata: list[dict[str, object]] = []
 
     try:
         for episode_id in range(args.num_episodes):
             reset_scene(model, data)
+            initial_pose = apply_dataset_initial_pose(args, model, data, rng, bounds_min, bounds_max)
             magnitude = float(rng.uniform(args.force_min, args.force_max))
             direction = sample_direction(rng, args.dir_z_min, args.dir_z_max)
             point_offset = sample_point_offset(rng, bounds_min, bounds_max, args.point_edge_margin_ratio)
             duration = float(rng.uniform(args.duration_min, args.duration_max))
             force = magnitude * direction
 
-            frames: list[np.ndarray] | None = [] if episode_id < args.preview_episodes else None
+            save_episode_video = bool(args.save_episode_videos or episode_id < args.preview_episodes)
+            frames: list[np.ndarray] | None = [] if save_episode_video else None
             trajectory_rows: list[list[float]] = []
             result = simulate_force(
                 model,
@@ -504,12 +792,34 @@ def generate_dataset(
                 renderer=renderer,
                 trajectory_rows=trajectory_rows,
                 stop_on_rest=True,
+                video_frame_stride=int(args.video_frame_stride),
             )
+            episode_video_path: Path | None = None
+            if frames is not None and frames:
+                output_dir = video_dir if args.save_episode_videos else preview_dir
+                output_dir.mkdir(parents=True, exist_ok=True)
+                episode_video_path = output_dir / f"episode_{episode_id:05d}.mp4"
+                fps = max(1.0, 30.0 * args.playback_speed)
+                write_video(episode_video_path, frames, fps=fps)
+
             trajectories.append(trajectory_rows_to_matrix(trajectory_rows))
             episode_metadata.append(
                 {
                     "episode_id": episode_id,
                     "seed": int(args.seed),
+                    "initial_block_position_world": np.asarray(initial_pose["position"], dtype=float).tolist(),
+                    "initial_block_quaternion_world": np.asarray(
+                        initial_pose["quaternion_wxyz"],
+                        dtype=float,
+                    ).tolist(),
+                    "initial_contact_face_id": initial_pose["contact_face_id"],
+                    "initial_contact_face_name": initial_pose["contact_face_name"],
+                    "initial_contact_face_normal_local": (
+                        None
+                        if initial_pose["contact_face_normal_local"] is None
+                        else np.asarray(initial_pose["contact_face_normal_local"], dtype=float).tolist()
+                    ),
+                    "initial_yaw_about_world_z": initial_pose["yaw_about_world_z"],
                     "force_magnitude": magnitude,
                     "direction_unit": direction.tolist(),
                     "applied_force_world": force.tolist(),
@@ -523,13 +833,9 @@ def generate_dataset(
                     "final_block_quaternion_world": result["final_block_quaternion_world"].tolist(),
                     "final_linear_speed": float(result["final_linear_speed"]),
                     "final_angular_speed": float(result["final_angular_speed"]),
+                    "video_path": str(episode_video_path.resolve()) if episode_video_path is not None else None,
                 }
             )
-
-            if frames is not None and frames:
-                preview_dir.mkdir(parents=True, exist_ok=True)
-                fps = max(1.0, 30.0 * args.playback_speed)
-                iio.imwrite(preview_dir / f"episode_{episode_id:05d}.mp4", np.stack(frames), fps=fps)
 
             if (episode_id + 1) % args.progress_every == 0 or episode_id + 1 == args.num_episodes:
                 total_samples = sum(item["recorded_samples"] for item in episode_metadata)
@@ -554,9 +860,22 @@ def generate_dataset(
         "duration_range": [float(args.duration_min), float(args.duration_max)],
         "dir_z_range": [float(args.dir_z_min), float(args.dir_z_max)],
         "point_edge_margin_ratio": float(args.point_edge_margin_ratio),
+        "randomize_initial_pose": bool(args.randomize_initial_pose),
+        "init_x_range": [float(args.init_x_min), float(args.init_x_max)],
+        "init_y_range": [float(args.init_y_min), float(args.init_y_max)],
+        "init_clearance": float(args.init_clearance),
+        "contact_face_normals": [
+            {"id": idx, "name": name, "normal_local": normal.tolist()}
+            for idx, (name, normal) in enumerate(CONTACT_FACE_NORMALS)
+        ],
         "block_local_bounds_min": bounds_min.tolist(),
         "block_local_bounds_max": bounds_max.tolist(),
         "preview_dir": str(preview_dir.resolve()) if args.preview_episodes > 0 else None,
+        "save_episode_videos": bool(args.save_episode_videos),
+        "episode_video_dir": str(video_dir.resolve()) if args.save_episode_videos else None,
+        "video_frame_stride": int(args.video_frame_stride),
+        "video_fps": max(1.0, 30.0 * args.playback_speed),
+        "video_count": int(args.num_episodes if args.save_episode_videos else min(args.preview_episodes, args.num_episodes)),
         "dataset_path": str(args.dataset_path.resolve()),
         "metadata_path": str(args.metadata_path.resolve()),
     }
@@ -576,10 +895,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("progress-every must be positive.")
     if args.preview_episodes < 0:
         raise ValueError("preview-episodes must be non-negative.")
+    if args.video_frame_stride <= 0:
+        raise ValueError("video-frame-stride must be positive.")
     if args.point_edge_margin_ratio < 0.0 or args.point_edge_margin_ratio >= 0.5:
         raise ValueError("point-edge-margin-ratio must be in [0, 0.5).")
 
     if args.num_episodes > 0:
+        if args.init_x_min > args.init_x_max:
+            raise ValueError("init-x-min must be <= init-x-max.")
+        if args.init_y_min > args.init_y_max:
+            raise ValueError("init-y-min must be <= init-y-max.")
+        if args.init_clearance < 0.0:
+            raise ValueError("init-clearance must be non-negative.")
         if args.force_min <= 0 or args.force_max <= 0 or args.force_min > args.force_max:
             raise ValueError("force-min and force-max must be positive and force-min <= force-max.")
         if args.duration_min <= 0 or args.duration_max <= 0 or args.duration_min > args.duration_max:
@@ -659,6 +986,59 @@ def parse_args() -> argparse.Namespace:
         help="Directory for dataset preview videos.",
     )
     parser.add_argument(
+        "--save-episode-videos",
+        action="store_true",
+        help="Save a video for every dataset episode.",
+    )
+    parser.add_argument(
+        "--episode-video-dir",
+        type=Path,
+        default=ROOT / "outputs" / "block_force_dataset_videos",
+        help="Directory for videos written by --save-episode-videos.",
+    )
+    parser.add_argument(
+        "--video-frame-stride",
+        type=int,
+        default=DEFAULT_VIDEO_FRAME_STRIDE,
+        help="Capture every Nth simulation step into exported videos.",
+    )
+    parser.add_argument(
+        "--randomize-initial-pose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In dataset mode, sample a random initial block position and contact face.",
+    )
+    parser.add_argument(
+        "--init-x-min",
+        type=float,
+        default=DEFAULT_INIT_X_RANGE[0],
+        help="Minimum sampled initial block X position in dataset mode.",
+    )
+    parser.add_argument(
+        "--init-x-max",
+        type=float,
+        default=DEFAULT_INIT_X_RANGE[1],
+        help="Maximum sampled initial block X position in dataset mode.",
+    )
+    parser.add_argument(
+        "--init-y-min",
+        type=float,
+        default=DEFAULT_INIT_Y_RANGE[0],
+        help="Minimum sampled initial block Y position in dataset mode.",
+    )
+    parser.add_argument(
+        "--init-y-max",
+        type=float,
+        default=DEFAULT_INIT_Y_RANGE[1],
+        help="Maximum sampled initial block Y position in dataset mode.",
+    )
+    parser.add_argument(
+        "--init-clearance",
+        type=float,
+        default=0.0,
+        help="Extra height above the floor after placing the selected contact face.",
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=100,
@@ -703,6 +1083,7 @@ def main() -> None:
             args.dataset_path,
             args.metadata_path,
             metadata,
+            args.video_frame_stride,
         )
     else:
         run_viewer(

@@ -8,12 +8,13 @@ import numpy as np
 from project_paths import DEFAULT_OUTPUT_DIR, REPO_ROOT
 
 
-DEFAULT_TRAJECTORY_NPZ_PATH = REPO_ROOT / "mujoco" / "outputs" / "block_force_trajectory.npz"
+DEFAULT_TRAJECTORY_NPZ_PATH = REPO_ROOT / "mujoco" / "outputs" / "block_force_dataset_2000.npz"
 DEFAULT_CONTACT_FRICTION_RESULTS_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit.npz"
+DEFAULT_CONTACT_FRICTION_CHECKPOINT_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit_checkpoint.npz"
 DEFAULT_CONTACT_FRICTION_SCENE_USD_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit.usda"
 DEFAULT_CONTACT_FRICTION_HEATMAP_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_heatmap.png"
 DEFAULT_TRAIN_BATCH_SIZE = 64
-DEFAULT_TRAJECTORY_PROGRESS_EVERY = 128
+DEFAULT_TRAJECTORY_PROGRESS_EVERY = 256
 
 
 def save_contact_friction_heatmap(
@@ -94,6 +95,23 @@ def parse_args() -> argparse.Namespace:
         help="Print trajectory progress every N trajectories during long train/eval passes. Use <=0 to disable.",
     )
     parser.add_argument("--results-path", type=Path, default=DEFAULT_CONTACT_FRICTION_RESULTS_PATH)
+    parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CONTACT_FRICTION_CHECKPOINT_PATH)
+    parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Resume optimizer state from a checkpoint NPZ.")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Save checkpoint every N successful iterations. Use <=0 to disable periodic checkpointing.",
+    )
+    parser.add_argument(
+        "--checkpoint-heatmap-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for per-checkpoint heatmaps. Defaults to "
+            "<checkpoint-path parent>/<checkpoint stem>_heatmaps."
+        ),
+    )
     parser.add_argument("--scene-usd-path", type=Path, default=DEFAULT_CONTACT_FRICTION_SCENE_USD_PATH)
     parser.add_argument("--heatmap-path", type=Path, default=DEFAULT_CONTACT_FRICTION_HEATMAP_PATH)
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
@@ -114,9 +132,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-point-friction", type=float, default=0.0)
     parser.add_argument("--max-point-friction", type=float, default=2.0)
     parser.add_argument("--position-loss-weight", type=float, default=1.0)
-    parser.add_argument("--orientation-loss-weight", type=float, default=0.1)
+    parser.add_argument("--orientation-loss-weight", type=float, default=0.0)
     parser.add_argument("--linear-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--angular-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--point-position-loss-reduction",
+        choices=("sum", "mean"),
+        default="mean",
+        help=(
+            "Reduce surface-point squared-distance loss over points. "
+            "'sum' matches per-point loss summation; 'mean' divides by the surface point count."
+        ),
+    )
     parser.add_argument("--log-every", type=int, default=5)
     parser.add_argument("--steps", type=int, default=0, help="Filled automatically from the trajectory after loading.")
     parser.add_argument("--dt", type=float, default=0.0, help="Filled automatically from the trajectory after loading.")

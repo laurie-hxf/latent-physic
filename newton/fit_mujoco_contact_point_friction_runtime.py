@@ -5,11 +5,10 @@ import argparse
 import numpy as np
 import warp as wp
 
-from mujoco_contact_friction_fit_utils import BatchedOptimizationBuffers, MujocoTrajectory, OptimizationBuffers
+from mujoco_contact_friction_fit_utils import BatchedOptimizationBuffers, MujocoTrajectory
 from newton_surface_points_diff_demo import (
     DiffScene,
     GRAVITY_MAGNITUDE,
-    compute_contact_weighted_masses_kernel,
 )
 
 
@@ -26,60 +25,13 @@ def reset_scene_states(diff_scene: DiffScene, initial_body_q: np.ndarray, initia
             state.body_parent_f.zero_()
 
 
-def build_optimization_buffers(
-    diff_scene: DiffScene,
-    trajectory: MujocoTrajectory,
-    args: argparse.Namespace,
-    active_indices: np.ndarray,
-    *,
-    max_steps_override: int | None = None,
-) -> OptimizationBuffers:
-    device = str(diff_scene.torch_device)
-    point_count = len(diff_scene.local_surface_points_np)
-    base_point_friction = np.full(point_count, float(args.point_friction), dtype=np.float32)
-    active_point_friction = np.full(len(active_indices), float(args.point_friction), dtype=np.float32)
-    step_limit = trajectory.num_steps if max_steps_override is None else min(int(max_steps_override), trajectory.num_steps)
-    step_frames = step_limit + 1
-
-    return OptimizationBuffers(
-        active_point_friction=wp.array(active_point_friction, dtype=wp.float32, device=device, requires_grad=True),
-        active_indices=wp.array(active_indices, dtype=wp.int32, device=device),
-        full_point_friction=wp.array(base_point_friction, dtype=wp.float32, device=device, requires_grad=True),
-        contact_weighted_masses=wp.zeros(point_count, dtype=wp.float32, device=device, requires_grad=True),
-        contact_weighted_mass_total=wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True),
-        step_forces=wp.array(trajectory.step_forces[:step_limit], dtype=wp.vec3, device=device),
-        step_application_points=wp.array(trajectory.step_application_points[:step_limit], dtype=wp.vec3, device=device),
-        target_positions=wp.array(trajectory.positions[:step_frames], dtype=wp.vec3, device=device),
-        target_quaternions=wp.array(trajectory.quaternions_xyzw[:step_frames], dtype=wp.vec4, device=device),
-        target_linear_velocity=wp.array(trajectory.linear_velocity[:step_frames], dtype=wp.vec3, device=device),
-        target_angular_velocity=wp.array(trajectory.angular_velocity[:step_frames], dtype=wp.vec3, device=device),
-        loss=wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True),
-        position_loss=wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True),
-        orientation_loss=wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True),
-        linear_velocity_loss=wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True),
-        angular_velocity_loss=wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True),
-        inactive_point_friction_np=base_point_friction,
-    )
-
-
-def build_optimization_buffers_for_collection(
-    diff_scene: DiffScene,
-    trajectories: list[MujocoTrajectory],
-    args: argparse.Namespace,
-    active_indices: np.ndarray,
-    *,
-    max_steps_override: int | None = None,
-) -> list[OptimizationBuffers]:
-    return [
-        build_optimization_buffers(
-            diff_scene=diff_scene,
-            trajectory=trajectory,
-            args=args,
-            active_indices=active_indices,
-            max_steps_override=max_steps_override,
-        )
-        for trajectory in trajectories
-    ]
+def resolve_point_position_loss_scale(args: argparse.Namespace, point_count: int) -> float:
+    reduction = getattr(args, "point_position_loss_reduction", "sum")
+    if reduction == "sum":
+        return 1.0
+    if reduction == "mean":
+        return 1.0 / max(int(point_count), 1)
+    raise ValueError(f"Unsupported --point-position-loss-reduction: {reduction!r}")
 
 
 def _pad_vec3_rows(values: np.ndarray, length: int) -> np.ndarray:
@@ -221,27 +173,6 @@ def sample_training_batch_indices(
     return np.sort(rng.choice(total_trajectories, size=batch_size, replace=False).astype(np.int32))
 
 
-def clear_optimization_grads(buffers: OptimizationBuffers) -> None:
-    if buffers.active_point_friction.grad is not None:
-        buffers.active_point_friction.grad.zero_()
-    if buffers.full_point_friction.grad is not None:
-        buffers.full_point_friction.grad.zero_()
-    if buffers.contact_weighted_masses.grad is not None:
-        buffers.contact_weighted_masses.grad.zero_()
-    if buffers.contact_weighted_mass_total.grad is not None:
-        buffers.contact_weighted_mass_total.grad.zero_()
-    if buffers.loss.grad is not None:
-        buffers.loss.grad.zero_()
-    if buffers.position_loss.grad is not None:
-        buffers.position_loss.grad.zero_()
-    if buffers.orientation_loss.grad is not None:
-        buffers.orientation_loss.grad.zero_()
-    if buffers.linear_velocity_loss.grad is not None:
-        buffers.linear_velocity_loss.grad.zero_()
-    if buffers.angular_velocity_loss.grad is not None:
-        buffers.angular_velocity_loss.grad.zero_()
-
-
 def clear_batched_optimization_grads(buffers: BatchedOptimizationBuffers) -> None:
     if buffers.active_point_friction.grad is not None:
         buffers.active_point_friction.grad.zero_()
@@ -265,149 +196,6 @@ def clear_batched_optimization_grads(buffers: BatchedOptimizationBuffers) -> Non
         buffers.batch_loss.grad.zero_()
 
 
-def forward_rollout_with_trajectory_loss(
-    diff_scene: DiffScene,
-    buffers: OptimizationBuffers,
-    trajectory: MujocoTrajectory,
-    args: argparse.Namespace,
-    *,
-    scatter_active_point_friction_kernel,
-    apply_external_and_surface_point_forces_trajectory_kernel,
-    accumulate_frame_loss_kernel,
-    combine_loss_components_kernel,
-) -> wp.array:
-    frame_scale = 1.0 / max(trajectory.num_frames, 1)
-    accumulate_velocity_loss = int(
-        args.linear_velocity_loss_weight > 0.0 or args.angular_velocity_loss_weight > 0.0
-    )
-
-    wp.launch(
-        scatter_active_point_friction_kernel,
-        dim=int(buffers.active_indices.shape[0]),
-        inputs=[buffers.active_indices, buffers.active_point_friction, buffers.full_point_friction],
-        device=diff_scene.model.device,
-    )
-
-    buffers.loss.zero_()
-    buffers.position_loss.zero_()
-    buffers.orientation_loss.zero_()
-    buffers.linear_velocity_loss.zero_()
-    buffers.angular_velocity_loss.zero_()
-    wp.launch(
-        accumulate_frame_loss_kernel,
-        dim=1,
-        inputs=[
-            diff_scene.box_body,
-            0,
-            diff_scene.states[0].body_q,
-            diff_scene.states[0].body_qd,
-            buffers.target_positions,
-            buffers.target_quaternions,
-            buffers.target_linear_velocity,
-            buffers.target_angular_velocity,
-            float(frame_scale),
-            buffers.position_loss,
-            buffers.orientation_loss,
-            buffers.linear_velocity_loss,
-            buffers.angular_velocity_loss,
-            accumulate_velocity_loss,
-        ],
-        device=diff_scene.model.device,
-    )
-
-    for step_idx in range(trajectory.num_steps):
-        state_in = diff_scene.states[step_idx]
-        state_out = diff_scene.states[step_idx + 1]
-        state_in.clear_forces()
-
-        buffers.contact_weighted_mass_total.zero_()
-        wp.launch(
-            compute_contact_weighted_masses_kernel,
-            dim=len(diff_scene.local_surface_points_np),
-            inputs=[
-                diff_scene.box_body,
-                state_in.body_q,
-                diff_scene.local_surface_points_wp,
-                diff_scene.point_masses_wp,
-                float(diff_scene.floor_top_z),
-                float(args.friction_contact_threshold),
-                buffers.contact_weighted_masses,
-                buffers.contact_weighted_mass_total,
-            ],
-            device=diff_scene.model.device,
-        )
-        wp.launch(
-            apply_external_and_surface_point_forces_trajectory_kernel,
-            dim=len(diff_scene.local_surface_points_np),
-            inputs=[
-                step_idx,
-                diff_scene.box_body,
-                state_in.body_q,
-                state_in.body_qd,
-                diff_scene.model.body_com,
-                diff_scene.local_surface_points_wp,
-                buffers.contact_weighted_masses,
-                buffers.contact_weighted_mass_total,
-                buffers.full_point_friction,
-                buffers.step_forces,
-                buffers.step_application_points,
-                float(diff_scene.box_mass),
-                float(GRAVITY_MAGNITUDE),
-                float(diff_scene.floor_top_z),
-                float(args.contact_stiffness),
-                float(args.contact_damping),
-                float(args.friction_contact_threshold),
-                float(args.friction_regularization),
-                state_in.body_f,
-            ],
-            device=diff_scene.model.device,
-        )
-
-        diff_scene.collision_pipeline.collide(state_in, diff_scene.contacts)
-        diff_scene.solver.step(state_in, state_out, diff_scene.control, diff_scene.contacts, float(args.dt))
-
-        wp.launch(
-            accumulate_frame_loss_kernel,
-            dim=1,
-            inputs=[
-                diff_scene.box_body,
-                step_idx + 1,
-                state_out.body_q,
-                state_out.body_qd,
-                buffers.target_positions,
-                buffers.target_quaternions,
-                buffers.target_linear_velocity,
-                buffers.target_angular_velocity,
-                float(frame_scale),
-                buffers.position_loss,
-                buffers.orientation_loss,
-                buffers.linear_velocity_loss,
-                buffers.angular_velocity_loss,
-                accumulate_velocity_loss,
-            ],
-            device=diff_scene.model.device,
-        )
-
-    wp.launch(
-        combine_loss_components_kernel,
-        dim=1,
-        inputs=[
-            buffers.position_loss,
-            buffers.orientation_loss,
-            buffers.linear_velocity_loss,
-            buffers.angular_velocity_loss,
-            float(args.position_loss_weight),
-            float(args.orientation_loss_weight),
-            float(args.linear_velocity_loss_weight),
-            float(args.angular_velocity_loss_weight),
-            buffers.loss,
-        ],
-        device=diff_scene.model.device,
-    )
-
-    return buffers.loss
-
-
 def forward_rollout_with_batched_trajectory_loss(
     diff_scene: DiffScene,
     buffers: BatchedOptimizationBuffers,
@@ -421,6 +209,7 @@ def forward_rollout_with_batched_trajectory_loss(
     sum_batched_losses_kernel,
 ) -> wp.array:
     point_count = len(diff_scene.local_surface_points_np)
+    point_scale = resolve_point_position_loss_scale(args, point_count)
     accumulate_velocity_loss = int(
         args.linear_velocity_loss_weight > 0.0 or args.angular_velocity_loss_weight > 0.0
     )
@@ -441,18 +230,21 @@ def forward_rollout_with_batched_trajectory_loss(
 
     wp.launch(
         accumulate_batched_frame_loss_kernel,
-        dim=buffers.batch_size,
+        dim=buffers.batch_size * point_count,
         inputs=[
             0,
             diff_scene.box_body_ids_wp,
             diff_scene.states[0].body_q,
             diff_scene.states[0].body_qd,
+            diff_scene.local_surface_points_wp,
             buffers.target_positions,
             buffers.target_quaternions,
             buffers.target_linear_velocity,
             buffers.target_angular_velocity,
             buffers.trajectory_step_counts,
             buffers.frame_scales,
+            float(point_scale),
+            point_count,
             buffers.max_frames,
             buffers.position_loss,
             buffers.orientation_loss,
@@ -520,18 +312,21 @@ def forward_rollout_with_batched_trajectory_loss(
 
         wp.launch(
             accumulate_batched_frame_loss_kernel,
-            dim=buffers.batch_size,
+            dim=buffers.batch_size * point_count,
             inputs=[
                 step_idx + 1,
                 diff_scene.box_body_ids_wp,
                 state_out.body_q,
                 state_out.body_qd,
+                diff_scene.local_surface_points_wp,
                 buffers.target_positions,
                 buffers.target_quaternions,
                 buffers.target_linear_velocity,
                 buffers.target_angular_velocity,
                 buffers.trajectory_step_counts,
                 buffers.frame_scales,
+                float(point_scale),
+                point_count,
                 buffers.max_frames,
                 buffers.position_loss,
                 buffers.orientation_loss,
@@ -566,43 +361,6 @@ def forward_rollout_with_batched_trajectory_loss(
     )
 
     return buffers.batch_loss
-
-
-def evaluate_loss(
-    diff_scene: DiffScene,
-    buffers: OptimizationBuffers,
-    trajectory: MujocoTrajectory,
-    args: argparse.Namespace,
-    initial_body_q: np.ndarray,
-    initial_body_qd: np.ndarray,
-    *,
-    scatter_active_point_friction_kernel,
-    apply_external_and_surface_point_forces_trajectory_kernel,
-    accumulate_frame_loss_kernel,
-    combine_loss_components_kernel,
-) -> tuple[float, float, float, float, float, list[np.ndarray]]:
-    reset_scene_states(diff_scene, initial_body_q, initial_body_qd)
-    buffers.full_point_friction.assign(buffers.inactive_point_friction_np)
-    clear_optimization_grads(buffers)
-    loss = forward_rollout_with_trajectory_loss(
-        diff_scene,
-        buffers,
-        trajectory,
-        args,
-        scatter_active_point_friction_kernel=scatter_active_point_friction_kernel,
-        apply_external_and_surface_point_forces_trajectory_kernel=apply_external_and_surface_point_forces_trajectory_kernel,
-        accumulate_frame_loss_kernel=accumulate_frame_loss_kernel,
-        combine_loss_components_kernel=combine_loss_components_kernel,
-    )
-    body_q_frames = [state.body_q.numpy().copy() for state in diff_scene.states[: trajectory.num_steps + 1]]
-    return (
-        float(loss.numpy()[0]),
-        float(buffers.position_loss.numpy()[0]),
-        float(buffers.orientation_loss.numpy()[0]),
-        float(buffers.linear_velocity_loss.numpy()[0]),
-        float(buffers.angular_velocity_loss.numpy()[0]),
-        body_q_frames,
-    )
 
 
 def evaluate_collection_loss_in_batches(

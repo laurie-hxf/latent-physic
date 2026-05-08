@@ -1,10 +1,9 @@
 git config --global user.name "laurie-hxf"
 git config --global user.email "1847238294@qq.com"
 export UV_CACHE_DIR=/workspace/.cache/uv
-# rm -rf /workspace/.venv
 # 假设 PVC 挂载在 /workspace
 export UV_INSTALL_DIR=/workspace/.local/bin
-export VENV_DIR="${VENV_DIR:-/workspace/.venv2}"
+export VENV_DIR="${VENV_DIR:-/.venv}"
 curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=$UV_INSTALL_DIR sh
 
 # 然后加到 PATH

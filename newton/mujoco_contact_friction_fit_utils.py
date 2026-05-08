@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
-import warp as wp
 
 from pbd_math import transform_points
+
+if TYPE_CHECKING:
+    import warp as wp
 
 
 @dataclass
@@ -53,27 +56,6 @@ class MujocoTrajectoryCollection:
         if not self.trajectories:
             return 0
         return max(trajectory.num_frames for trajectory in self.trajectories)
-
-
-@dataclass
-class OptimizationBuffers:
-    active_point_friction: wp.array
-    active_indices: wp.array
-    full_point_friction: wp.array
-    contact_weighted_masses: wp.array
-    contact_weighted_mass_total: wp.array
-    step_forces: wp.array
-    step_application_points: wp.array
-    target_positions: wp.array
-    target_quaternions: wp.array
-    target_linear_velocity: wp.array
-    target_angular_velocity: wp.array
-    loss: wp.array
-    position_loss: wp.array
-    orientation_loss: wp.array
-    linear_velocity_loss: wp.array
-    angular_velocity_loss: wp.array
-    inactive_point_friction_np: np.ndarray
 
 
 @dataclass
@@ -144,34 +126,6 @@ def _truncate_trajectory(
         timestep=timestep,
         metadata=dict(metadata),
     )
-
-
-def load_mujoco_trajectory(trajectory_npz_path: Path, max_steps: int | None) -> MujocoTrajectory:
-    with np.load(trajectory_npz_path, allow_pickle=True) as data:
-        time = np.asarray(data["time"], dtype=np.float32)
-        positions = np.asarray(data["position"], dtype=np.float32)
-        quaternions_wxyz = np.asarray(data["quaternion"], dtype=np.float32)
-        linear_velocity = np.asarray(data["linear_velocity"], dtype=np.float32)
-        angular_velocity = np.asarray(data["angular_velocity"], dtype=np.float32)
-        applied_force = np.asarray(data["applied_force"], dtype=np.float32)
-        application_point = np.asarray(data["application_point"], dtype=np.float32)
-        metadata_json = data["metadata_json"].item() if "metadata_json" in data.files else "{}"
-
-    metadata = json.loads(metadata_json)
-    try:
-        return _truncate_trajectory(
-            time=time,
-            positions=positions,
-            quaternions_wxyz=quaternions_wxyz,
-            linear_velocity=linear_velocity,
-            angular_velocity=angular_velocity,
-            applied_force=applied_force,
-            application_point=application_point,
-            metadata=metadata,
-            max_steps=max_steps,
-        )
-    except ValueError as exc:
-        raise ValueError(f"{trajectory_npz_path} {exc}") from exc
 
 
 def load_mujoco_trajectory_dataset(
@@ -320,16 +274,14 @@ def load_mujoco_trajectories(
     max_trajectories: int | None = None,
 ) -> MujocoTrajectoryCollection:
     with np.load(trajectory_npz_path, allow_pickle=True) as data:
-        if "trajectories" in data.files and "columns" in data.files and "episode_lengths" in data.files:
-            return load_mujoco_trajectory_dataset(trajectory_npz_path, max_steps, max_trajectories)
-
-    trajectory = load_mujoco_trajectory(trajectory_npz_path, max_steps)
-    return MujocoTrajectoryCollection(
-        trajectories=[trajectory],
-        source_type="single_trajectory",
-        source_path=trajectory_npz_path,
-        metadata=trajectory.metadata,
-    )
+        required_dataset_keys = {"trajectories", "columns", "episode_lengths"}
+        missing_keys = sorted(required_dataset_keys.difference(data.files))
+    if missing_keys:
+        raise ValueError(
+            f"{trajectory_npz_path} is not a MuJoCo trajectory dataset; missing keys: {missing_keys}. "
+            "Single-trajectory NPZ loading is no longer supported."
+        )
+    return load_mujoco_trajectory_dataset(trajectory_npz_path, max_steps, max_trajectories)
 
 
 def compute_active_contact_point_indices(
