@@ -25,6 +25,22 @@ def reset_scene_states(diff_scene: DiffScene, initial_body_q: np.ndarray, initia
             state.body_parent_f.zero_()
 
 
+@wp.kernel
+def set_batched_box_initial_states_kernel(
+    box_body_ids: wp.array(dtype=wp.int32),
+    initial_positions: wp.array(dtype=wp.vec3),
+    initial_quaternions: wp.array(dtype=wp.quat),
+    initial_linear_velocity: wp.array(dtype=wp.vec3),
+    initial_angular_velocity: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+):
+    batch_idx = wp.tid()
+    body_id = box_body_ids[batch_idx]
+    body_q[body_id] = wp.transform(initial_positions[batch_idx], initial_quaternions[batch_idx])
+    body_qd[body_id] = wp.spatial_vector(initial_linear_velocity[batch_idx], initial_angular_velocity[batch_idx])
+
+
 def resolve_point_position_loss_scale(args: argparse.Namespace, point_count: int) -> float:
     reduction = getattr(args, "point_position_loss_reduction", "sum")
     if reduction == "sum":
@@ -80,6 +96,10 @@ def build_batched_optimization_buffers(
     target_quaternions = np.zeros((batch_size, max(max_frames, 1), 4), dtype=np.float32)
     target_linear_velocity = np.zeros((batch_size, max(max_frames, 1), 3), dtype=np.float32)
     target_angular_velocity = np.zeros((batch_size, max(max_frames, 1), 3), dtype=np.float32)
+    initial_positions = np.zeros((batch_size, 3), dtype=np.float32)
+    initial_quaternions = np.zeros((batch_size, 4), dtype=np.float32)
+    initial_linear_velocity = np.zeros((batch_size, 3), dtype=np.float32)
+    initial_angular_velocity = np.zeros((batch_size, 3), dtype=np.float32)
 
     for batch_idx, trajectory in enumerate(trajectories):
         step_forces[batch_idx] = _pad_vec3_rows(trajectory.step_forces, max(max_steps, 1))
@@ -88,6 +108,10 @@ def build_batched_optimization_buffers(
         target_quaternions[batch_idx] = _pad_vec4_rows(trajectory.quaternions_xyzw, max(max_frames, 1))
         target_linear_velocity[batch_idx] = _pad_vec3_rows(trajectory.linear_velocity, max(max_frames, 1))
         target_angular_velocity[batch_idx] = _pad_vec3_rows(trajectory.angular_velocity, max(max_frames, 1))
+        initial_positions[batch_idx] = target_positions[batch_idx, 0]
+        initial_quaternions[batch_idx] = target_quaternions[batch_idx, 0]
+        initial_linear_velocity[batch_idx] = target_linear_velocity[batch_idx, 0]
+        initial_angular_velocity[batch_idx] = target_angular_velocity[batch_idx, 0]
 
     return BatchedOptimizationBuffers(
         batch_size=batch_size,
@@ -100,6 +124,10 @@ def build_batched_optimization_buffers(
         contact_weighted_mass_total=wp.zeros(batch_size, dtype=wp.float32, device=device, requires_grad=True),
         step_forces=wp.array(step_forces.reshape(-1, 3), dtype=wp.vec3, device=device),
         step_application_points=wp.array(step_application_points.reshape(-1, 3), dtype=wp.vec3, device=device),
+        initial_positions=wp.array(initial_positions, dtype=wp.vec3, device=device),
+        initial_quaternions=wp.array(initial_quaternions, dtype=wp.quat, device=device),
+        initial_linear_velocity=wp.array(initial_linear_velocity, dtype=wp.vec3, device=device),
+        initial_angular_velocity=wp.array(initial_angular_velocity, dtype=wp.vec3, device=device),
         target_positions=wp.array(target_positions.reshape(-1, 3), dtype=wp.vec3, device=device),
         target_quaternions=wp.array(target_quaternions.reshape(-1, 4), dtype=wp.vec4, device=device),
         target_linear_velocity=wp.array(target_linear_velocity.reshape(-1, 3), dtype=wp.vec3, device=device),
@@ -227,6 +255,21 @@ def forward_rollout_with_batched_trajectory_loss(
     buffers.linear_velocity_loss.zero_()
     buffers.angular_velocity_loss.zero_()
     buffers.batch_loss.zero_()
+
+    wp.launch(
+        set_batched_box_initial_states_kernel,
+        dim=buffers.batch_size,
+        inputs=[
+            diff_scene.box_body_ids_wp,
+            buffers.initial_positions,
+            buffers.initial_quaternions,
+            buffers.initial_linear_velocity,
+            buffers.initial_angular_velocity,
+            diff_scene.states[0].body_q,
+            diff_scene.states[0].body_qd,
+        ],
+        device=diff_scene.model.device,
+    )
 
     wp.launch(
         accumulate_batched_frame_loss_kernel,

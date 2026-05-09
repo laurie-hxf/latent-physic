@@ -6,7 +6,7 @@ import numpy as np
 
 from pbd_usd import export_scene_usd
 
-from fit_mujoco_contact_point_friction_io import save_contact_friction_heatmap
+from fit_mujoco_contact_point_friction_io import save_contact_friction_point_cloud
 
 
 def export_contact_friction_outputs(
@@ -34,11 +34,13 @@ def export_contact_friction_outputs(
     )
     learned_point_friction[active_indices] = best_active_params
 
-    save_contact_friction_heatmap(
+    save_contact_friction_point_cloud(
         local_surface_points=diff_scene.local_surface_points_np,
+        point_friction=learned_point_friction,
+        output_path=args.point_cloud_path,
         active_indices=active_indices,
-        active_point_friction=best_active_params,
-        output_path=args.heatmap_path,
+        color_min=args.point_cloud_color_min if args.point_cloud_color_min is not None else float(args.point_friction) - 0.005,
+        color_max=args.point_cloud_color_max if args.point_cloud_color_max is not None else float(args.point_friction) + 0.005,
     )
 
     args.results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +71,7 @@ def export_contact_friction_outputs(
         final_orientation_loss=np.asarray(final_orientation_loss, dtype=np.float32),
         final_linear_velocity_loss=np.asarray(final_linear_velocity_loss, dtype=np.float32),
         final_angular_velocity_loss=np.asarray(final_angular_velocity_loss, dtype=np.float32),
-        heatmap_path=np.asarray(str(args.heatmap_path)),
+        point_cloud_path=np.asarray(str(args.point_cloud_path)),
     )
 
     if args.scene_usd_path is not None:

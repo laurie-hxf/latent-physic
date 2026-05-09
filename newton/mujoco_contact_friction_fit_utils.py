@@ -70,6 +70,10 @@ class BatchedOptimizationBuffers:
     contact_weighted_mass_total: wp.array
     step_forces: wp.array
     step_application_points: wp.array
+    initial_positions: wp.array
+    initial_quaternions: wp.array
+    initial_linear_velocity: wp.array
+    initial_angular_velocity: wp.array
     target_positions: wp.array
     target_quaternions: wp.array
     target_linear_velocity: wp.array

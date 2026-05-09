@@ -14,7 +14,7 @@ from mujoco_contact_friction_fit_wandb import build_wandb_log_payload, init_wand
 from fit_mujoco_contact_point_friction_io import (
     DEFAULT_TRAIN_BATCH_SIZE,
     parse_args,
-    save_contact_friction_heatmap,
+    save_contact_friction_point_cloud,
 )
 from fit_mujoco_contact_point_friction_output import export_contact_friction_outputs
 from fit_mujoco_contact_point_friction_runtime import (
@@ -43,6 +43,7 @@ def save_training_checkpoint(
     active_params: np.ndarray,
     adam_m: np.ndarray,
     adam_v: np.ndarray,
+    adam_step: np.ndarray,
     best_loss: float,
     best_active_params: np.ndarray,
     loss_history: list[float],
@@ -57,6 +58,7 @@ def save_training_checkpoint(
         active_params=np.asarray(active_params, dtype=np.float32),
         adam_m=np.asarray(adam_m, dtype=np.float64),
         adam_v=np.asarray(adam_v, dtype=np.float64),
+        adam_step=np.asarray(adam_step, dtype=np.int32),
         best_loss=np.asarray(best_loss, dtype=np.float64),
         best_active_params=np.asarray(best_active_params, dtype=np.float32),
         loss_history=np.asarray(loss_history, dtype=np.float32),
@@ -67,12 +69,66 @@ def save_training_checkpoint(
     )
 
 
-def resolve_checkpoint_heatmap_path(args: argparse.Namespace, iteration: int):
-    if args.checkpoint_heatmap_dir is None:
-        heatmap_dir = args.checkpoint_path.parent / f"{args.checkpoint_path.stem}_heatmaps"
+def resolve_checkpoint_point_cloud_path(args: argparse.Namespace, iteration: int):
+    if args.checkpoint_point_cloud_dir is None:
+        point_cloud_dir = args.checkpoint_path.parent / f"{args.checkpoint_path.stem}_point_clouds"
     else:
-        heatmap_dir = args.checkpoint_heatmap_dir
-    return heatmap_dir / f"iter_{int(iteration):06d}.png"
+        point_cloud_dir = args.checkpoint_point_cloud_dir
+    return point_cloud_dir / f"iter_{int(iteration):06d}.ply"
+
+
+def should_save_iteration_checkpoint(args: argparse.Namespace, iteration: int) -> bool:
+    checkpoint_every = int(args.checkpoint_every)
+    return checkpoint_every > 0 and (iteration % checkpoint_every == 0 or iteration == int(args.opt_iters))
+
+
+def save_iteration_checkpoint_and_point_cloud(
+    *,
+    args: argparse.Namespace,
+    iteration: int,
+    active_indices: np.ndarray,
+    active_params: np.ndarray,
+    adam_m: np.ndarray,
+    adam_v: np.ndarray,
+    adam_step: np.ndarray,
+    best_loss: float,
+    best_active_params: np.ndarray,
+    loss_history: list[float],
+    rng: np.random.Generator,
+    local_surface_points: np.ndarray,
+    point_cloud_color_min: float,
+    point_cloud_color_max: float,
+) -> None:
+    save_training_checkpoint(
+        checkpoint_path=args.checkpoint_path,
+        iteration=iteration,
+        active_indices=active_indices,
+        active_params=active_params,
+        adam_m=adam_m,
+        adam_v=adam_v,
+        adam_step=adam_step,
+        best_loss=best_loss,
+        best_active_params=best_active_params,
+        loss_history=loss_history,
+        rng=rng,
+        args=args,
+    )
+    checkpoint_point_cloud_path = resolve_checkpoint_point_cloud_path(args, iteration)
+    checkpoint_point_friction = np.full(
+        len(local_surface_points),
+        float(args.point_friction),
+        dtype=np.float32,
+    )
+    checkpoint_point_friction[active_indices] = active_params
+    save_contact_friction_point_cloud(
+        local_surface_points=local_surface_points,
+        point_friction=checkpoint_point_friction,
+        output_path=checkpoint_point_cloud_path,
+        active_indices=active_indices,
+        color_min=point_cloud_color_min,
+        color_max=point_cloud_color_max,
+    )
+    log_message(f"checkpoint_point_cloud_written_to={checkpoint_point_cloud_path.resolve()}")
 
 
 def load_training_checkpoint(
@@ -80,7 +136,7 @@ def load_training_checkpoint(
     checkpoint_path,
     active_indices: np.ndarray,
     rng: np.random.Generator,
-) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, list[float]]:
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, list[float]]:
     with np.load(checkpoint_path, allow_pickle=True) as data:
         checkpoint_active_indices = np.asarray(data["active_indices"], dtype=np.int32)
         if checkpoint_active_indices.shape != active_indices.shape or not np.array_equal(checkpoint_active_indices, active_indices):
@@ -93,6 +149,10 @@ def load_training_checkpoint(
         active_params = np.asarray(data["active_params"], dtype=np.float32)
         adam_m = np.asarray(data["adam_m"], dtype=np.float64)
         adam_v = np.asarray(data["adam_v"], dtype=np.float64)
+        if "adam_step" in data.files:
+            adam_step = np.asarray(data["adam_step"], dtype=np.int32)
+        else:
+            adam_step = np.zeros_like(active_indices, dtype=np.int32)
         best_loss = float(np.asarray(data["best_loss"]).item())
         best_active_params = np.asarray(data["best_active_params"], dtype=np.float32)
         loss_history = [float(value) for value in np.asarray(data["loss_history"], dtype=np.float32)]
@@ -102,6 +162,7 @@ def load_training_checkpoint(
             ("active_params", active_params),
             ("adam_m", adam_m),
             ("adam_v", adam_v),
+            ("adam_step", adam_step),
             ("best_active_params", best_active_params),
         ):
             if values.shape != expected_shape:
@@ -110,7 +171,32 @@ def load_training_checkpoint(
         rng_state = data["rng_state"].item()
         rng.bit_generator.state = rng_state
 
-    return iteration, active_params, adam_m, adam_v, best_loss, best_active_params, loss_history
+    return iteration, active_params, adam_m, adam_v, adam_step, best_loss, best_active_params, loss_history
+
+
+def compute_batch_active_point_indices(
+    trajectory_active_indices_by_idx: list[np.ndarray],
+    batch_indices: np.ndarray,
+    point_count: int,
+) -> np.ndarray:
+    batch_active_mask = np.zeros(int(point_count), dtype=bool)
+    for trajectory_idx in batch_indices:
+        batch_active_mask[trajectory_active_indices_by_idx[int(trajectory_idx)]] = True
+    return np.flatnonzero(batch_active_mask).astype(np.int32)
+
+
+def resolve_point_cloud_color_bounds(args: argparse.Namespace) -> tuple[float, float]:
+    color_min = args.point_cloud_color_min
+    color_max = args.point_cloud_color_max
+    if color_min is None:
+        color_min = float(args.point_friction) - 0.005
+    if color_max is None:
+        color_max = float(args.point_friction) + 0.005
+    if float(color_max) <= float(color_min):
+        raise ValueError(
+            f"--point-cloud-color-max must be greater than --point-cloud-color-min, got {color_max} <= {color_min}"
+        )
+    return float(color_min), float(color_max)
 
 
 @wp.kernel
@@ -122,6 +208,16 @@ def scatter_active_point_friction_kernel(
     tid = wp.tid()
     point_idx = active_indices[tid]
     full_point_friction[point_idx] = active_point_friction[tid]
+
+
+@wp.kernel
+def gather_active_point_friction_kernel(
+    global_active_point_friction: wp.array(dtype=float),
+    active_param_positions: wp.array(dtype=wp.int32),
+    batch_active_point_friction: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    batch_active_point_friction[tid] = global_active_point_friction[active_param_positions[tid]]
 
 
 @wp.func
@@ -369,27 +465,59 @@ def adam_update_kernel(
 
 
 @wp.kernel
-def flag_nonfinite_array_at_index_kernel(
-    values: wp.array(dtype=float),
-    nonfinite_flags: wp.array(dtype=wp.int32),
-    flag_index: int,
+def accumulate_gradient_norm_sq_kernel(
+    grads: wp.array(dtype=float),
+    norm_sq: wp.array(dtype=wp.float64),
+    nonfinite_count: wp.array(dtype=wp.int32),
 ):
     tid = wp.tid()
-    value = values[tid]
-    if value != value or value > 1.0e30 or value < -1.0e30:
-        wp.atomic_add(nonfinite_flags, flag_index, 1)
+    grad = grads[tid]
+    if grad != grad or grad > 1.0e38 or grad < -1.0e38:
+        wp.atomic_add(nonfinite_count, 0, 1)
+        return
+
+    grad64 = wp.float64(grad)
+    wp.atomic_add(norm_sq, 0, grad64 * grad64)
 
 
 @wp.kernel
-def add_float32_array_to_float64_if_unflagged_kernel(
-    dst: wp.array(dtype=wp.float64),
-    src: wp.array(dtype=float),
-    nonfinite_flags: wp.array(dtype=wp.int32),
-    flag_index: int,
+def sparse_adam_update_clipped_kernel(
+    global_params: wp.array(dtype=float),
+    grads: wp.array(dtype=float),
+    active_param_positions: wp.array(dtype=wp.int32),
+    first_moment: wp.array(dtype=wp.float64),
+    second_moment: wp.array(dtype=wp.float64),
+    adam_step: wp.array(dtype=wp.int32),
+    beta1_power: wp.array(dtype=wp.float64),
+    beta2_power: wp.array(dtype=wp.float64),
+    grad_scale: wp.float64,
+    learning_rate: wp.float64,
+    beta1: wp.float64,
+    beta2: wp.float64,
+    eps: wp.float64,
+    min_value: wp.float64,
+    max_value: wp.float64,
 ):
     tid = wp.tid()
-    if nonfinite_flags[flag_index] == 0:
-        dst[tid] = dst[tid] + wp.float64(src[tid])
+    pos = active_param_positions[tid]
+    one = wp.float64(1.0)
+
+    grad = wp.float64(grads[tid]) * grad_scale
+    moment_1 = beta1 * first_moment[pos] + (one - beta1) * grad
+    moment_2 = beta2 * second_moment[pos] + (one - beta2) * (grad * grad)
+    beta1_power_next = beta1_power[pos] * beta1
+    beta2_power_next = beta2_power[pos] * beta2
+
+    first_hat = moment_1 / (one - beta1_power_next)
+    second_hat = moment_2 / (one - beta2_power_next)
+    updated = wp.float64(global_params[pos]) - learning_rate * first_hat / (wp.sqrt(second_hat) + eps)
+
+    global_params[pos] = wp.float32(wp.min(wp.max(updated, min_value), max_value))
+    first_moment[pos] = moment_1
+    second_moment[pos] = moment_2
+    adam_step[pos] = adam_step[pos] + 1
+    beta1_power[pos] = beta1_power_next
+    beta2_power[pos] = beta2_power_next
 
 
 def main() -> None:
@@ -417,6 +545,7 @@ def main() -> None:
 
     log_message("computing active contact point mask across trajectories")
     active_mask = np.zeros(len(diff_scene.local_surface_points_np), dtype=bool)
+    trajectory_active_indices_by_idx: list[np.ndarray] = []
     for trajectory_idx, trajectory in enumerate(trajectories, start=1):
         trajectory_active_indices = compute_active_contact_point_indices(
             local_surface_points=diff_scene.local_surface_points_np,
@@ -424,6 +553,7 @@ def main() -> None:
             floor_top_z=diff_scene.floor_top_z,
             contact_threshold=float(args.contact_mask_threshold),
         )
+        trajectory_active_indices_by_idx.append(trajectory_active_indices)
         active_mask[trajectory_active_indices] = True
         if should_log_trajectory_progress(
             trajectory_idx,
@@ -441,6 +571,10 @@ def main() -> None:
         f"active contact points={len(active_indices)} / surface points={len(diff_scene.local_surface_points_np)} "
         f"| startup_elapsed={time.time() - startup_time:.2f}s"
     )
+    point_cloud_color_min, point_cloud_color_max = resolve_point_cloud_color_bounds(args)
+    log_message(
+        f"point cloud color range=[{point_cloud_color_min:.6f}, {point_cloud_color_max:.6f}]"
+    )
 
     wandb_run = init_wandb(args, trajectory_collection, active_indices)
     if wandb_run is not None:
@@ -449,13 +583,12 @@ def main() -> None:
             f"run={wandb_run.name} | mode={args.wandb_mode}"
         )
 
-    device = str(diff_scene.torch_device)
     active_params_np = np.full(len(active_indices), float(args.point_friction), dtype=np.float32)
-    active_params = wp.array(active_params_np, dtype=wp.float32, device=device)
-    adam_m = wp.zeros(len(active_indices), dtype=wp.float64, device=device)
-    adam_v = wp.zeros(len(active_indices), dtype=wp.float64, device=device)
-    grad_value_total_wp = wp.zeros(len(active_indices), dtype=wp.float64, device=device)
-    nonfinite_flag = wp.zeros(1, dtype=wp.int32, device=device)
+    active_param_lookup = np.full(len(diff_scene.local_surface_points_np), -1, dtype=np.int32)
+    active_param_lookup[active_indices] = np.arange(len(active_indices), dtype=np.int32)
+    adam_m_np = np.zeros(len(active_indices), dtype=np.float64)
+    adam_v_np = np.zeros(len(active_indices), dtype=np.float64)
+    adam_step_np = np.zeros(len(active_indices), dtype=np.int32)
     loss_history: list[float] = []
     best_loss = float("inf")
     best_active_params = active_params_np.copy()
@@ -467,6 +600,7 @@ def main() -> None:
             active_params_np,
             adam_m_np,
             adam_v_np,
+            adam_step_np,
             best_loss,
             best_active_params,
             loss_history,
@@ -475,26 +609,86 @@ def main() -> None:
             active_indices=active_indices,
             rng=rng,
         )
-        active_params.assign(active_params_np)
-        adam_m.assign(adam_m_np)
-        adam_v.assign(adam_v_np)
         start_iteration = resume_iteration + 1
         log_message(
             f"resumed checkpoint {args.resume_checkpoint.resolve()} "
             f"at iteration={resume_iteration} best_loss={best_loss:.6f}"
         )
+    device = str(diff_scene.torch_device)
+    active_indices_wp = wp.array(active_indices, dtype=wp.int32, device=device)
+    active_params = wp.array(active_params_np, dtype=wp.float32, device=device)
+    adam_m = wp.array(adam_m_np, dtype=wp.float64, device=device)
+    adam_v = wp.array(adam_v_np, dtype=wp.float64, device=device)
+    adam_step = wp.array(adam_step_np, dtype=wp.int32, device=device)
+    beta1_power = wp.array(
+        np.power(float(args.adam_beta1), adam_step_np.astype(np.float64)),
+        dtype=wp.float64,
+        device=device,
+    )
+    beta2_power = wp.array(
+        np.power(float(args.adam_beta2), adam_step_np.astype(np.float64)),
+        dtype=wp.float64,
+        device=device,
+    )
+
+    def save_iteration_checkpoint(iteration: int) -> None:
+        save_iteration_checkpoint_and_point_cloud(
+            args=args,
+            iteration=iteration,
+            active_indices=active_indices,
+            active_params=active_params_np,
+            adam_m=adam_m_np,
+            adam_v=adam_v_np,
+            adam_step=adam_step_np,
+            best_loss=best_loss,
+            best_active_params=best_active_params,
+            loss_history=loss_history,
+            rng=rng,
+            local_surface_points=diff_scene.local_surface_points_np,
+            point_cloud_color_min=point_cloud_color_min,
+            point_cloud_color_max=point_cloud_color_max,
+        )
+
     try:
         for iteration in range(start_iteration, max(int(args.opt_iters), 0) + 1):
             iteration_start = time.time()
             batch_indices = sample_training_batch_indices(len(trajectories), batch_size, rng)
             batch_trajectories = [trajectories[int(idx)] for idx in batch_indices]
-            buffers = build_batched_optimization_buffers(diff_scene, batch_trajectories, args, active_indices)
-            buffers.active_point_friction.assign(active_params)
+            batch_active_indices = compute_batch_active_point_indices(
+                trajectory_active_indices_by_idx,
+                batch_indices,
+                len(diff_scene.local_surface_points_np),
+            )
+            if len(batch_active_indices) == 0:
+                if should_save_iteration_checkpoint(args, iteration):
+                    save_iteration_checkpoint(iteration)
+                    log_message(f"iter={iteration:04d} skipped=no_batch_active_points checkpoint_saved=1")
+                continue
+            batch_active_param_positions = active_param_lookup[batch_active_indices]
+            if np.any(batch_active_param_positions < 0):
+                raise RuntimeError("Batch active points must be a subset of the global active point mask.")
+
+            batch_active_param_positions_wp = wp.array(
+                batch_active_param_positions,
+                dtype=wp.int32,
+                device=device,
+            )
+            buffers = build_batched_optimization_buffers(diff_scene, batch_trajectories, args, batch_active_indices)
             buffers.full_point_friction.assign(buffers.inactive_point_friction_np)
+            wp.launch(
+                scatter_active_point_friction_kernel,
+                dim=len(active_indices),
+                inputs=[active_indices_wp, active_params, buffers.full_point_friction],
+                device=diff_scene.model.device,
+            )
+            wp.launch(
+                gather_active_point_friction_kernel,
+                dim=len(batch_active_indices),
+                inputs=[active_params, batch_active_param_positions_wp, buffers.active_point_friction],
+                device=diff_scene.model.device,
+            )
             clear_batched_optimization_grads(buffers)
 
-            grad_value_total_wp.zero_()
-            nonfinite_flag.zero_()
             tape = wp.Tape()
             with tape:
                 reset_scene_states(diff_scene, initial_body_q, initial_body_qd)
@@ -513,24 +707,25 @@ def main() -> None:
 
             if buffers.active_point_friction.grad is None:
                 tape.zero()
+                if should_save_iteration_checkpoint(args, iteration):
+                    save_iteration_checkpoint(iteration)
+                    log_message(f"iter={iteration:04d} skipped=missing_grad checkpoint_saved=1")
                 continue
 
+            grad_norm_sq = wp.zeros(1, dtype=wp.float64, device=device)
+            nonfinite_grad_count = wp.zeros(1, dtype=wp.int32, device=device)
             wp.launch(
-                flag_nonfinite_array_at_index_kernel,
-                dim=len(active_indices),
-                inputs=[buffers.active_point_friction.grad, nonfinite_flag, 0],
+                accumulate_gradient_norm_sq_kernel,
+                dim=len(batch_active_indices),
+                inputs=[buffers.active_point_friction.grad, grad_norm_sq, nonfinite_grad_count],
                 device=diff_scene.model.device,
             )
-            if int(nonfinite_flag.numpy()[0]) != 0:
+            if int(nonfinite_grad_count.numpy()[0]) != 0:
                 tape.zero()
+                if should_save_iteration_checkpoint(args, iteration):
+                    save_iteration_checkpoint(iteration)
+                    log_message(f"iter={iteration:04d} skipped=nonfinite_grad checkpoint_saved=1")
                 continue
-
-            wp.launch(
-                add_float32_array_to_float64_if_unflagged_kernel,
-                dim=len(active_indices),
-                inputs=[grad_value_total_wp, buffers.active_point_friction.grad, nonfinite_flag, 0],
-                device=diff_scene.model.device,
-            )
 
             good_buffer_count = len(batch_trajectories)
             loss_value = float(np.mean(buffers.loss.numpy()))
@@ -542,26 +737,29 @@ def main() -> None:
             orientation_loss_value = float(args.orientation_loss_weight) * raw_orientation_loss_value
             linear_velocity_loss_value = float(args.linear_velocity_loss_weight) * raw_linear_velocity_loss_value
             angular_velocity_loss_value = float(args.angular_velocity_loss_weight) * raw_angular_velocity_loss_value
-            grad_value = grad_value_total_wp.numpy()
-            assert_array_finite(
-                "batch grad_value_total",
-                grad_value,
-                context=f"iter={iteration:04d} after gradient accumulation",
-            )
+            raw_grad_norm = float(np.sqrt(max(float(grad_norm_sq.numpy()[0]), 0.0)))
+            grad_clip_norm = args.grad_clip_norm
+            if grad_clip_norm is None or float(grad_clip_norm) <= 0.0 or raw_grad_norm <= float(grad_clip_norm):
+                grad_clip_scale = 1.0
+                clipped_grad_norm = raw_grad_norm
+            else:
+                grad_clip_scale = float(grad_clip_norm) / max(raw_grad_norm, 1.0e-30)
+                clipped_grad_norm = float(grad_clip_norm)
             beta1 = float(args.adam_beta1)
             beta2 = float(args.adam_beta2)
-            bias_correction1 = 1.0 - beta1**iteration
-            bias_correction2 = 1.0 - beta2**iteration
             wp.launch(
-                adam_update_kernel,
-                dim=len(active_indices),
+                sparse_adam_update_clipped_kernel,
+                dim=len(batch_active_indices),
                 inputs=[
                     active_params,
-                    grad_value_total_wp,
+                    buffers.active_point_friction.grad,
+                    batch_active_param_positions_wp,
                     adam_m,
                     adam_v,
-                    np.float64(bias_correction1),
-                    np.float64(bias_correction2),
+                    adam_step,
+                    beta1_power,
+                    beta2_power,
+                    np.float64(grad_clip_scale),
                     np.float64(args.learning_rate),
                     np.float64(beta1),
                     np.float64(beta2),
@@ -574,6 +772,7 @@ def main() -> None:
             active_params_np = active_params.numpy().astype(np.float32)
             adam_m_np = adam_m.numpy()
             adam_v_np = adam_v.numpy()
+            adam_step_np = adam_step.numpy()
             assert_array_finite(
                 "active_params",
                 active_params_np,
@@ -596,31 +795,14 @@ def main() -> None:
                 best_loss = loss_value
                 best_active_params = active_params_np.copy()
 
-            checkpoint_every = int(args.checkpoint_every)
-            if checkpoint_every > 0 and (iteration % checkpoint_every == 0 or iteration == int(args.opt_iters)):
-                save_training_checkpoint(
-                    checkpoint_path=args.checkpoint_path,
-                    iteration=iteration,
-                    active_indices=active_indices,
-                    active_params=active_params_np,
-                    adam_m=adam_m_np,
-                    adam_v=adam_v_np,
-                    best_loss=best_loss,
-                    best_active_params=best_active_params,
-                    loss_history=loss_history,
-                    rng=rng,
-                    args=args,
-                )
-                checkpoint_heatmap_path = resolve_checkpoint_heatmap_path(args, iteration)
-                save_contact_friction_heatmap(
-                    local_surface_points=diff_scene.local_surface_points_np,
-                    active_indices=active_indices,
-                    active_point_friction=active_params_np,
-                    output_path=checkpoint_heatmap_path,
-                )
-                log_message(f"checkpoint_heatmap_written_to={checkpoint_heatmap_path.resolve()}")
+            if should_save_iteration_checkpoint(args, iteration):
+                save_iteration_checkpoint(iteration)
 
             if wandb_run is not None:
+                # Log the clipped batch gradient so the scalar stats match the optimizer update.
+                logged_grad_np = np.asarray(buffers.active_point_friction.grad.numpy(), dtype=np.float64)
+                if grad_clip_scale != 1.0:
+                    logged_grad_np = logged_grad_np * grad_clip_scale
                 log_payload = build_wandb_log_payload(
                     loss_value=loss_value,
                     position_loss_value=position_loss_value,
@@ -631,10 +813,15 @@ def main() -> None:
                     raw_orientation_loss_value=raw_orientation_loss_value,
                     raw_linear_velocity_loss_value=raw_linear_velocity_loss_value,
                     raw_angular_velocity_loss_value=raw_angular_velocity_loss_value,
-                    grad_value=grad_value,
+                    grad_value=logged_grad_np,
                     active_params=active_params_np,
                     active_indices=active_indices,
+                    grad_norm_value=clipped_grad_norm,
                 )
+                log_payload["params/batch_active_contact_point_count"] = float(len(batch_active_indices))
+                log_payload["train/raw_grad_norm"] = float(raw_grad_norm)
+                log_payload["train/clipped_grad_norm"] = float(clipped_grad_norm)
+                log_payload["train/grad_clip_scale"] = float(grad_clip_scale)
                 wandb_run.log(log_payload, step=iteration)
 
             if iteration == 1 or iteration % max(int(args.log_every), 1) == 0 or iteration == int(args.opt_iters):
@@ -644,9 +831,12 @@ def main() -> None:
                     f"ori={orientation_loss_value:.6f} "
                     f"linvel={linear_velocity_loss_value:.6f} "
                     f"angvel={angular_velocity_loss_value:.6f} "
-                    f"grad_norm={float(np.linalg.norm(grad_value)):.6f} "
+                    f"grad_norm={clipped_grad_norm:.6f} "
+                    f"raw_grad_norm={raw_grad_norm:.6f} "
+                    f"clip_scale={grad_clip_scale:.6g} "
                     f"mu_min={float(active_params_np.min()):.6f} "
                     f"mu_max={float(active_params_np.max()):.6f} "
+                    f"batch_active_points={len(batch_active_indices)}/{len(active_indices)} "
                     f"batch={good_buffer_count}/{len(batch_trajectories)} "
                     f"elapsed={time.time() - iteration_start:.2f}s"
                 )
@@ -714,7 +904,7 @@ def main() -> None:
             wandb_run.summary["mu_min"] = float(best_active_params.min())
             wandb_run.summary["mu_max"] = float(best_active_params.max())
             wandb_run.summary["results_path"] = str(args.results_path.resolve())
-            wandb_run.summary["heatmap_path"] = str(args.heatmap_path.resolve())
+            wandb_run.summary["point_cloud_path"] = str(args.point_cloud_path.resolve())
             if args.scene_usd_path is not None:
                 wandb_run.summary["scene_usd_path"] = str(args.scene_usd_path.resolve())
 
@@ -729,7 +919,7 @@ def main() -> None:
         log_message(f"final_linear_velocity_loss={final_linear_velocity_loss_contribution:.6f}")
         log_message(f"final_angular_velocity_loss={final_angular_velocity_loss_contribution:.6f}")
         log_message(f"results_written_to={args.results_path.resolve()}")
-        log_message(f"heatmap_written_to={args.heatmap_path.resolve()}")
+        log_message(f"point_cloud_written_to={args.point_cloud_path.resolve()}")
         if args.scene_usd_path is not None:
             log_message(f"scene_usd_written_to={args.scene_usd_path.resolve()}")
     finally:
