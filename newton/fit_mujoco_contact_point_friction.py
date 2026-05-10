@@ -199,6 +199,49 @@ def resolve_point_cloud_color_bounds(args: argparse.Namespace) -> tuple[float, f
     return float(color_min), float(color_max)
 
 
+def format_nonfinite_gradient_diagnostics(
+    *,
+    grad_values: np.ndarray,
+    loss_values: np.ndarray,
+    batch_loss_value: float,
+) -> str:
+    grads = np.asarray(grad_values)
+    losses = np.asarray(loss_values)
+    grad_abs = np.abs(grads)
+    finite_grad_mask = np.isfinite(grads)
+    huge_grad_mask = finite_grad_mask & (grad_abs > 1.0e38)
+    bad_grad_mask = (~finite_grad_mask) | huge_grad_mask
+    bad_indices = np.flatnonzero(bad_grad_mask)
+    if len(bad_indices) > 0:
+        first_bad_index = int(bad_indices[0])
+        first_bad_value = float(grads.reshape(-1)[first_bad_index])
+    else:
+        first_bad_index = -1
+        first_bad_value = float("nan")
+
+    finite_grad_abs = grad_abs[finite_grad_mask & (~huge_grad_mask)]
+    finite_grad_abs_max = float(np.max(finite_grad_abs)) if len(finite_grad_abs) > 0 else float("nan")
+    finite_loss_mask = np.isfinite(losses)
+    finite_losses = losses[finite_loss_mask]
+    loss_min = float(np.min(finite_losses)) if len(finite_losses) > 0 else float("nan")
+    loss_max = float(np.max(finite_losses)) if len(finite_losses) > 0 else float("nan")
+
+    return (
+        f"grad_nan_count={int(np.count_nonzero(np.isnan(grads)))} "
+        f"grad_posinf_count={int(np.count_nonzero(np.isposinf(grads)))} "
+        f"grad_neginf_count={int(np.count_nonzero(np.isneginf(grads)))} "
+        f"grad_huge_count={int(np.count_nonzero(huge_grad_mask))} "
+        f"finite_grad_count={int(np.count_nonzero(finite_grad_mask & (~huge_grad_mask)))} "
+        f"finite_grad_abs_max={finite_grad_abs_max:.6g} "
+        f"first_bad_grad_index={first_bad_index} "
+        f"first_bad_grad_value={first_bad_value:.6g} "
+        f"batch_loss={float(batch_loss_value):.6g} "
+        f"loss_finite_count={int(np.count_nonzero(finite_loss_mask))}/{losses.size} "
+        f"loss_min={loss_min:.6g} "
+        f"loss_max={loss_max:.6g}"
+    )
+
+
 @wp.kernel
 def scatter_active_point_friction_kernel(
     active_indices: wp.array(dtype=wp.int32),
@@ -229,10 +272,12 @@ def rotate_point_by_quat_xyzw(quat: wp.vec4, point: wp.vec3) -> wp.vec3:
 
 @wp.kernel
 def compute_batched_contact_weighted_masses_kernel(
+    step_idx: int,
     box_body_ids: wp.array(dtype=wp.int32),
     body_q: wp.array(dtype=wp.transform),
     local_surface_points: wp.array(dtype=wp.vec3),
     point_masses: wp.array(dtype=float),
+    batch_size: int,
     point_count: int,
     floor_top_z: float,
     contact_band: float,
@@ -249,8 +294,10 @@ def compute_batched_contact_weighted_masses_kernel(
     safe_band = wp.max(contact_band, 1.0e-6)
     activation = _smoothstep01((contact_band - gap) / safe_band)
     weighted_mass = activation * point_masses[point_idx]
-    weighted_masses[tid] = weighted_mass
-    wp.atomic_add(total_weighted_mass, batch_idx, weighted_mass)
+    weighted_mass_idx = step_idx * batch_size * point_count + tid
+    total_weight_idx = step_idx * batch_size + batch_idx
+    weighted_masses[weighted_mass_idx] = weighted_mass
+    wp.atomic_add(total_weighted_mass, total_weight_idx, weighted_mass)
 
 
 @wp.kernel
@@ -267,6 +314,7 @@ def apply_batched_external_and_surface_point_forces_trajectory_kernel(
     step_forces: wp.array(dtype=wp.vec3),
     step_application_points: wp.array(dtype=wp.vec3),
     trajectory_step_counts: wp.array(dtype=wp.int32),
+    batch_size: int,
     point_count: int,
     max_steps: int,
     total_mass: float,
@@ -297,7 +345,9 @@ def apply_batched_external_and_surface_point_forces_trajectory_kernel(
         external_torque = wp.cross(external_moment_arm, external_force)
         wp.atomic_add(body_f, body_id, wp.spatial_vector(external_force, external_torque))
 
-    total_weight = total_weighted_mass[batch_idx]
+    weighted_mass_idx = step_idx * batch_size * point_count + tid
+    total_weight_idx = step_idx * batch_size + batch_idx
+    total_weight = total_weighted_mass[total_weight_idx]
     if total_weight <= 1.0e-8:
         return
 
@@ -312,7 +362,7 @@ def apply_batched_external_and_surface_point_forces_trajectory_kernel(
     penetration = wp.max(-gap, 0.0)
     safe_band = wp.max(contact_band, 1.0e-6)
     activation = _smoothstep01((contact_band - gap) / safe_band)
-    mass_fraction = weighted_masses[tid] / total_weight
+    mass_fraction = weighted_masses[weighted_mass_idx] / total_weight
 
     external_force = step_forces[step_offset]
     normal_load_total = wp.max(0.0, total_mass * gravity_magnitude - external_force[2])
@@ -481,6 +531,69 @@ def accumulate_gradient_norm_sq_kernel(
 
 
 @wp.kernel
+def accumulate_iteration_scalar_stats_kernel(
+    losses: wp.array(dtype=float),
+    position_losses: wp.array(dtype=float),
+    orientation_losses: wp.array(dtype=float),
+    linear_velocity_losses: wp.array(dtype=float),
+    angular_velocity_losses: wp.array(dtype=float),
+    scale: wp.float64,
+    stats: wp.array(dtype=wp.float64),
+):
+    tid = wp.tid()
+    wp.atomic_add(stats, 0, wp.float64(losses[tid]) * scale)
+    wp.atomic_add(stats, 1, wp.float64(position_losses[tid]) * scale)
+    wp.atomic_add(stats, 2, wp.float64(orientation_losses[tid]) * scale)
+    wp.atomic_add(stats, 3, wp.float64(linear_velocity_losses[tid]) * scale)
+    wp.atomic_add(stats, 4, wp.float64(angular_velocity_losses[tid]) * scale)
+
+
+@wp.kernel
+def accumulate_gradient_scalar_stats_kernel(
+    grads: wp.array(dtype=float),
+    stats: wp.array(dtype=wp.float64),
+):
+    tid = wp.tid()
+    grad = grads[tid]
+    if not wp.isfinite(grad) or grad > 1.0e38 or grad < -1.0e38:
+        wp.atomic_add(stats, 8, wp.float64(1.0))
+        return
+
+    grad64 = wp.float64(grad)
+    abs_grad = wp.abs(grad64)
+    wp.atomic_add(stats, 5, grad64 * grad64)
+    wp.atomic_add(stats, 6, abs_grad)
+    wp.atomic_max(stats, 7, abs_grad)
+
+
+@wp.kernel
+def accumulate_optimizer_scalar_stats_kernel(
+    params: wp.array(dtype=float),
+    first_moment: wp.array(dtype=wp.float64),
+    second_moment: wp.array(dtype=wp.float64),
+    stats: wp.array(dtype=wp.float64),
+):
+    tid = wp.tid()
+    param = params[tid]
+    if wp.isfinite(param) and param <= 1.0e38 and param >= -1.0e38:
+        param64 = wp.float64(param)
+        wp.atomic_add(stats, 0, param64)
+        wp.atomic_add(stats, 1, param64 * param64)
+        wp.atomic_min(stats, 2, param64)
+        wp.atomic_max(stats, 3, param64)
+    else:
+        wp.atomic_add(stats, 4, wp.float64(1.0))
+
+    moment_1 = first_moment[tid]
+    if not wp.isfinite(moment_1):
+        wp.atomic_add(stats, 5, wp.float64(1.0))
+
+    moment_2 = second_moment[tid]
+    if not wp.isfinite(moment_2):
+        wp.atomic_add(stats, 6, wp.float64(1.0))
+
+
+@wp.kernel
 def sparse_adam_update_clipped_kernel(
     global_params: wp.array(dtype=float),
     grads: wp.array(dtype=float),
@@ -630,8 +743,26 @@ def main() -> None:
         dtype=wp.float64,
         device=device,
     )
+    best_active_params_device = wp.array(best_active_params, dtype=wp.float32, device=device)
+
+    def sync_best_active_params(*, context: str) -> None:
+        nonlocal best_active_params
+        best_active_params = best_active_params_device.numpy().astype(np.float32)
+        assert_array_finite("best_active_params", best_active_params, context=context)
+
+    def sync_optimizer_state(*, context: str) -> None:
+        nonlocal active_params_np, adam_m_np, adam_v_np, adam_step_np
+        active_params_np = active_params.numpy().astype(np.float32)
+        adam_m_np = adam_m.numpy()
+        adam_v_np = adam_v.numpy()
+        adam_step_np = adam_step.numpy()
+        assert_array_finite("active_params", active_params_np, context=context)
+        assert_array_finite("adam_m", adam_m_np, context=context)
+        assert_array_finite("adam_v", adam_v_np, context=context)
+        sync_best_active_params(context=context)
 
     def save_iteration_checkpoint(iteration: int) -> None:
+        sync_optimizer_state(context=f"iter={iteration:04d} checkpoint")
         save_iteration_checkpoint_and_point_cloud(
             args=args,
             iteration=iteration,
@@ -660,9 +791,15 @@ def main() -> None:
                 len(diff_scene.local_surface_points_np),
             )
             if len(batch_active_indices) == 0:
-                if should_save_iteration_checkpoint(args, iteration):
+                checkpoint_saved = should_save_iteration_checkpoint(args, iteration)
+                if checkpoint_saved:
                     save_iteration_checkpoint(iteration)
-                    log_message(f"iter={iteration:04d} skipped=no_batch_active_points checkpoint_saved=1")
+                log_message(
+                    f"iter={iteration:04d} skipped=no_batch_active_points "
+                    f"checkpoint_saved={int(checkpoint_saved)} "
+                    f"batch=0/{len(batch_trajectories)} "
+                    f"elapsed={time.time() - iteration_start:.2f}s"
+                )
                 continue
             batch_active_param_positions = active_param_lookup[batch_active_indices]
             if np.any(batch_active_param_positions < 0):
@@ -707,37 +844,75 @@ def main() -> None:
 
             if buffers.active_point_friction.grad is None:
                 tape.zero()
-                if should_save_iteration_checkpoint(args, iteration):
+                checkpoint_saved = should_save_iteration_checkpoint(args, iteration)
+                if checkpoint_saved:
                     save_iteration_checkpoint(iteration)
-                    log_message(f"iter={iteration:04d} skipped=missing_grad checkpoint_saved=1")
+                log_message(
+                    f"iter={iteration:04d} skipped=missing_grad "
+                    f"checkpoint_saved={int(checkpoint_saved)} "
+                    f"batch_active_points={len(batch_active_indices)}/{len(active_indices)} "
+                    f"batch={len(batch_trajectories)}/{len(batch_trajectories)} "
+                    f"elapsed={time.time() - iteration_start:.2f}s"
+                )
                 continue
 
-            grad_norm_sq = wp.zeros(1, dtype=wp.float64, device=device)
-            nonfinite_grad_count = wp.zeros(1, dtype=wp.int32, device=device)
+            scalar_stats = wp.zeros(9, dtype=wp.float64, device=device)
+            good_buffer_count = len(batch_trajectories)
             wp.launch(
-                accumulate_gradient_norm_sq_kernel,
-                dim=len(batch_active_indices),
-                inputs=[buffers.active_point_friction.grad, grad_norm_sq, nonfinite_grad_count],
+                accumulate_iteration_scalar_stats_kernel,
+                dim=good_buffer_count,
+                inputs=[
+                    buffers.loss,
+                    buffers.position_loss,
+                    buffers.orientation_loss,
+                    buffers.linear_velocity_loss,
+                    buffers.angular_velocity_loss,
+                    np.float64(1.0 / max(good_buffer_count, 1)),
+                    scalar_stats,
+                ],
                 device=diff_scene.model.device,
             )
-            if int(nonfinite_grad_count.numpy()[0]) != 0:
+            wp.launch(
+                accumulate_gradient_scalar_stats_kernel,
+                dim=len(batch_active_indices),
+                inputs=[buffers.active_point_friction.grad, scalar_stats],
+                device=diff_scene.model.device,
+            )
+            scalar_stats_np = scalar_stats.numpy()
+            nonfinite_grad_count_value = int(round(float(scalar_stats_np[8])))
+            if nonfinite_grad_count_value != 0:
+                grad_diagnostics = format_nonfinite_gradient_diagnostics(
+                    grad_values=buffers.active_point_friction.grad.numpy(),
+                    loss_values=buffers.loss.numpy(),
+                    batch_loss_value=float(buffers.batch_loss.numpy()[0]),
+                )
                 tape.zero()
-                if should_save_iteration_checkpoint(args, iteration):
+                checkpoint_saved = should_save_iteration_checkpoint(args, iteration)
+                if checkpoint_saved:
                     save_iteration_checkpoint(iteration)
-                    log_message(f"iter={iteration:04d} skipped=nonfinite_grad checkpoint_saved=1")
+                log_message(
+                    f"iter={iteration:04d} skipped=nonfinite_grad "
+                    f"nonfinite_grad_count={nonfinite_grad_count_value} "
+                    f"{grad_diagnostics} "
+                    f"checkpoint_saved={int(checkpoint_saved)} "
+                    f"batch_active_points={len(batch_active_indices)}/{len(active_indices)} "
+                    f"batch={len(batch_trajectories)}/{len(batch_trajectories)} "
+                    f"elapsed={time.time() - iteration_start:.2f}s"
+                )
                 continue
 
-            good_buffer_count = len(batch_trajectories)
-            loss_value = float(np.mean(buffers.loss.numpy()))
-            raw_position_loss_value = float(np.mean(buffers.position_loss.numpy()))
-            raw_orientation_loss_value = float(np.mean(buffers.orientation_loss.numpy()))
-            raw_linear_velocity_loss_value = float(np.mean(buffers.linear_velocity_loss.numpy()))
-            raw_angular_velocity_loss_value = float(np.mean(buffers.angular_velocity_loss.numpy()))
+            loss_value = float(scalar_stats_np[0])
+            raw_position_loss_value = float(scalar_stats_np[1])
+            raw_orientation_loss_value = float(scalar_stats_np[2])
+            raw_linear_velocity_loss_value = float(scalar_stats_np[3])
+            raw_angular_velocity_loss_value = float(scalar_stats_np[4])
             position_loss_value = float(args.position_loss_weight) * raw_position_loss_value
             orientation_loss_value = float(args.orientation_loss_weight) * raw_orientation_loss_value
             linear_velocity_loss_value = float(args.linear_velocity_loss_weight) * raw_linear_velocity_loss_value
             angular_velocity_loss_value = float(args.angular_velocity_loss_weight) * raw_angular_velocity_loss_value
-            raw_grad_norm = float(np.sqrt(max(float(grad_norm_sq.numpy()[0]), 0.0)))
+            raw_grad_norm = float(np.sqrt(max(float(scalar_stats_np[5]), 0.0)))
+            grad_abs_mean_value = float(scalar_stats_np[6]) / max(len(batch_active_indices), 1)
+            grad_abs_max_value = float(scalar_stats_np[7])
             grad_clip_norm = args.grad_clip_norm
             if grad_clip_norm is None or float(grad_clip_norm) <= 0.0 or raw_grad_norm <= float(grad_clip_norm):
                 grad_clip_scale = 1.0
@@ -745,6 +920,8 @@ def main() -> None:
             else:
                 grad_clip_scale = float(grad_clip_norm) / max(raw_grad_norm, 1.0e-30)
                 clipped_grad_norm = float(grad_clip_norm)
+                grad_abs_mean_value *= grad_clip_scale
+                grad_abs_max_value *= grad_clip_scale
             beta1 = float(args.adam_beta1)
             beta2 = float(args.adam_beta2)
             wp.launch(
@@ -769,40 +946,48 @@ def main() -> None:
                 ],
                 device=diff_scene.model.device,
             )
-            active_params_np = active_params.numpy().astype(np.float32)
-            adam_m_np = adam_m.numpy()
-            adam_v_np = adam_v.numpy()
-            adam_step_np = adam_step.numpy()
-            assert_array_finite(
-                "active_params",
-                active_params_np,
-                context=f"iter={iteration:04d} after Adam update",
+
+            optimizer_stats = wp.array(
+                np.asarray([0.0, 0.0, np.inf, -np.inf, 0.0, 0.0, 0.0], dtype=np.float64),
+                dtype=wp.float64,
+                device=device,
             )
-            assert_array_finite(
-                "adam_m",
-                adam_m_np,
-                context=f"iter={iteration:04d} after Adam update",
+            wp.launch(
+                accumulate_optimizer_scalar_stats_kernel,
+                dim=len(active_indices),
+                inputs=[active_params, adam_m, adam_v, optimizer_stats],
+                device=diff_scene.model.device,
             )
-            assert_array_finite(
-                "adam_v",
-                adam_v_np,
-                context=f"iter={iteration:04d} after Adam update",
-            )
+            optimizer_stats_np = optimizer_stats.numpy()
+            param_nonfinite_count = int(round(float(optimizer_stats_np[4])))
+            adam_m_nonfinite_count = int(round(float(optimizer_stats_np[5])))
+            adam_v_nonfinite_count = int(round(float(optimizer_stats_np[6])))
+            if param_nonfinite_count != 0 or adam_m_nonfinite_count != 0 or adam_v_nonfinite_count != 0:
+                tape.zero()
+                raise FloatingPointError(
+                    f"iter={iteration:04d} after Adam update: "
+                    f"active_params_nonfinite_count={param_nonfinite_count} "
+                    f"adam_m_nonfinite_count={adam_m_nonfinite_count} "
+                    f"adam_v_nonfinite_count={adam_v_nonfinite_count}"
+                )
+
+            param_count = max(len(active_indices), 1)
+            mu_mean_value = float(optimizer_stats_np[0]) / param_count
+            mu_squares_mean = float(optimizer_stats_np[1]) / param_count
+            mu_std_value = float(np.sqrt(max(mu_squares_mean - mu_mean_value * mu_mean_value, 0.0)))
+            mu_min_value = float(optimizer_stats_np[2])
+            mu_max_value = float(optimizer_stats_np[3])
             tape.zero()
             loss_history.append(loss_value)
 
             if loss_value < best_loss:
                 best_loss = loss_value
-                best_active_params = active_params_np.copy()
+                best_active_params_device.assign(active_params)
 
             if should_save_iteration_checkpoint(args, iteration):
                 save_iteration_checkpoint(iteration)
 
             if wandb_run is not None:
-                # Log the clipped batch gradient so the scalar stats match the optimizer update.
-                logged_grad_np = np.asarray(buffers.active_point_friction.grad.numpy(), dtype=np.float64)
-                if grad_clip_scale != 1.0:
-                    logged_grad_np = logged_grad_np * grad_clip_scale
                 log_payload = build_wandb_log_payload(
                     loss_value=loss_value,
                     position_loss_value=position_loss_value,
@@ -813,10 +998,16 @@ def main() -> None:
                     raw_orientation_loss_value=raw_orientation_loss_value,
                     raw_linear_velocity_loss_value=raw_linear_velocity_loss_value,
                     raw_angular_velocity_loss_value=raw_angular_velocity_loss_value,
-                    grad_value=logged_grad_np,
-                    active_params=active_params_np,
+                    grad_value=None,
+                    active_params=None,
                     active_indices=active_indices,
                     grad_norm_value=clipped_grad_norm,
+                    grad_abs_mean_value=grad_abs_mean_value,
+                    grad_abs_max_value=grad_abs_max_value,
+                    mu_mean_value=mu_mean_value,
+                    mu_std_value=mu_std_value,
+                    mu_min_value=mu_min_value,
+                    mu_max_value=mu_max_value,
                 )
                 log_payload["params/batch_active_contact_point_count"] = float(len(batch_active_indices))
                 log_payload["train/raw_grad_norm"] = float(raw_grad_norm)
@@ -834,13 +1025,14 @@ def main() -> None:
                     f"grad_norm={clipped_grad_norm:.6f} "
                     f"raw_grad_norm={raw_grad_norm:.6f} "
                     f"clip_scale={grad_clip_scale:.6g} "
-                    f"mu_min={float(active_params_np.min()):.6f} "
-                    f"mu_max={float(active_params_np.max()):.6f} "
+                    f"mu_min={mu_min_value:.6f} "
+                    f"mu_max={mu_max_value:.6f} "
                     f"batch_active_points={len(batch_active_indices)}/{len(active_indices)} "
                     f"batch={good_buffer_count}/{len(batch_trajectories)} "
                     f"elapsed={time.time() - iteration_start:.2f}s"
                 )
 
+        sync_best_active_params(context="final export")
         log_message("running final evaluation across the configured trajectory set")
         final_loss, final_position_loss, final_orientation_loss, final_linear_velocity_loss, final_angular_velocity_loss, body_q_frames = evaluate_collection_loss_in_batches(
             diff_scene=diff_scene,

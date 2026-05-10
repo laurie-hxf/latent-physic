@@ -113,6 +113,8 @@ def build_batched_optimization_buffers(
         initial_linear_velocity[batch_idx] = target_linear_velocity[batch_idx, 0]
         initial_angular_velocity[batch_idx] = target_angular_velocity[batch_idx, 0]
 
+    contact_step_capacity = max(max_steps, 1)
+
     return BatchedOptimizationBuffers(
         batch_size=batch_size,
         max_steps=max_steps,
@@ -120,8 +122,8 @@ def build_batched_optimization_buffers(
         active_point_friction=wp.array(active_point_friction, dtype=wp.float32, device=device, requires_grad=True),
         active_indices=wp.array(active_indices, dtype=wp.int32, device=device),
         full_point_friction=wp.array(base_point_friction, dtype=wp.float32, device=device, requires_grad=True),
-        contact_weighted_masses=wp.zeros(batch_size * point_count, dtype=wp.float32, device=device, requires_grad=True),
-        contact_weighted_mass_total=wp.zeros(batch_size, dtype=wp.float32, device=device, requires_grad=True),
+        contact_weighted_masses=wp.zeros(contact_step_capacity * batch_size * point_count, dtype=wp.float32, device=device),
+        contact_weighted_mass_total=wp.zeros(contact_step_capacity * batch_size, dtype=wp.float32, device=device),
         step_forces=wp.array(step_forces.reshape(-1, 3), dtype=wp.vec3, device=device),
         step_application_points=wp.array(step_application_points.reshape(-1, 3), dtype=wp.vec3, device=device),
         initial_positions=wp.array(initial_positions, dtype=wp.vec3, device=device),
@@ -206,10 +208,6 @@ def clear_batched_optimization_grads(buffers: BatchedOptimizationBuffers) -> Non
         buffers.active_point_friction.grad.zero_()
     if buffers.full_point_friction.grad is not None:
         buffers.full_point_friction.grad.zero_()
-    if buffers.contact_weighted_masses.grad is not None:
-        buffers.contact_weighted_masses.grad.zero_()
-    if buffers.contact_weighted_mass_total.grad is not None:
-        buffers.contact_weighted_mass_total.grad.zero_()
     if buffers.loss.grad is not None:
         buffers.loss.grad.zero_()
     if buffers.position_loss.grad is not None:
@@ -255,6 +253,8 @@ def forward_rollout_with_batched_trajectory_loss(
     buffers.linear_velocity_loss.zero_()
     buffers.angular_velocity_loss.zero_()
     buffers.batch_loss.zero_()
+    buffers.contact_weighted_masses.zero_()
+    buffers.contact_weighted_mass_total.zero_()
 
     wp.launch(
         set_batched_box_initial_states_kernel,
@@ -303,15 +303,16 @@ def forward_rollout_with_batched_trajectory_loss(
         state_out = diff_scene.states[step_idx + 1]
         state_in.clear_forces()
 
-        buffers.contact_weighted_mass_total.zero_()
         wp.launch(
             compute_batched_contact_weighted_masses_kernel,
             dim=buffers.batch_size * point_count,
             inputs=[
+                step_idx,
                 diff_scene.box_body_ids_wp,
                 state_in.body_q,
                 diff_scene.local_surface_points_wp,
                 diff_scene.point_masses_wp,
+                buffers.batch_size,
                 point_count,
                 float(diff_scene.floor_top_z),
                 float(args.friction_contact_threshold),
@@ -336,6 +337,7 @@ def forward_rollout_with_batched_trajectory_loss(
                 buffers.step_forces,
                 buffers.step_application_points,
                 buffers.trajectory_step_counts,
+                buffers.batch_size,
                 point_count,
                 buffers.max_steps,
                 float(diff_scene.box_mass),

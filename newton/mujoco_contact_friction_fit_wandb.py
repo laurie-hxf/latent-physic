@@ -77,18 +77,35 @@ def build_wandb_log_payload(
     raw_linear_velocity_loss_value: float,
     raw_angular_velocity_loss_value: float,
     grad_value: np.ndarray | None,
-    active_params: np.ndarray,
+    active_params: np.ndarray | None = None,
     active_indices: np.ndarray,
     grad_norm_value: float | None = None,
+    grad_abs_mean_value: float | None = None,
+    grad_abs_max_value: float | None = None,
+    mu_mean_value: float | None = None,
+    mu_std_value: float | None = None,
+    mu_min_value: float | None = None,
+    mu_max_value: float | None = None,
 ) -> dict[str, float]:
     if grad_value is None:
         grad_norm = float("nan") if grad_norm_value is None else float(grad_norm_value)
-        grad_abs_mean = float("nan")
-        grad_abs_max = float("nan")
+        grad_abs_mean = float("nan") if grad_abs_mean_value is None else float(grad_abs_mean_value)
+        grad_abs_max = float("nan") if grad_abs_max_value is None else float(grad_abs_max_value)
     else:
         grad_norm = float(np.linalg.norm(grad_value))
         grad_abs_mean = float(np.mean(np.abs(grad_value)))
         grad_abs_max = float(np.max(np.abs(grad_value)))
+
+    if active_params is None:
+        mu_mean = float("nan") if mu_mean_value is None else float(mu_mean_value)
+        mu_std = float("nan") if mu_std_value is None else float(mu_std_value)
+        mu_min = float("nan") if mu_min_value is None else float(mu_min_value)
+        mu_max = float("nan") if mu_max_value is None else float(mu_max_value)
+    else:
+        mu_mean = float(active_params.mean())
+        mu_std = float(active_params.std())
+        mu_min = float(active_params.min())
+        mu_max = float(active_params.max())
 
     return {
         "train/loss": float(loss_value),
@@ -102,10 +119,10 @@ def build_wandb_log_payload(
         "loss_raw/angular_velocity": float(raw_angular_velocity_loss_value),
         "train/grad_norm": grad_norm,
         "params/contact_point_count": float(len(active_indices)),
-        "params/mu_mean": float(active_params.mean()),
-        "params/mu_std": float(active_params.std()),
-        "params/mu_min": float(active_params.min()),
-        "params/mu_max": float(active_params.max()),
+        "params/mu_mean": mu_mean,
+        "params/mu_std": mu_std,
+        "params/mu_min": mu_min,
+        "params/mu_max": mu_max,
         "grads/mu_abs_mean": grad_abs_mean,
         "grads/mu_abs_max": grad_abs_max,
     }

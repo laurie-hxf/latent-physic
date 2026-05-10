@@ -1,19 +1,20 @@
 git config --global user.name "laurie-hxf"
 git config --global user.email "1847238294@qq.com"
-export UV_CACHE_DIR=/workspace/.cache/uv
-# 假设 PVC 挂载在 /workspace
-export UV_INSTALL_DIR=/workspace/.local/bin
-export VENV_DIR="${VENV_DIR:-/.venv}"
-curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=$UV_INSTALL_DIR sh
+apt update && apt install procps -y
+# export UV_CACHE_DIR=/workspace/.cache/uv
+# # 假设 PVC 挂载在 /workspace
+# export UV_INSTALL_DIR=/workspace/.local/bin
+# export VENV_DIR="${VENV_DIR:-/.venv}"
+# curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=$UV_INSTALL_DIR sh
 
-# 然后加到 PATH
-export PATH="/workspace/.local/bin:$PATH"
+# # 然后加到 PATH
+# export PATH="/workspace/.local/bin:$PATH"
 
-uv venv --python 3.11 "$VENV_DIR"
+# uv venv --python 3.11 "$VENV_DIR"
 
-source "$VENV_DIR/bin/activate"
+# source "$VENV_DIR/bin/activate"
 
-uv pip install -r requirements.txt
+# uv pip install -r requirements.txt
 set -a
 source /workspace/.secrets/wandb.env
 set +a
