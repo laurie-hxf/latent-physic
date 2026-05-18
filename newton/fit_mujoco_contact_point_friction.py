@@ -1030,7 +1030,7 @@ def main() -> None:
             grad_clip_total_count += 1
             if grad_was_clipped:
                 grad_clip_clipped_count += 1
-            grad_clip_ratio_value = 100.0 * grad_clip_clipped_count / max(grad_clip_total_count, 1)
+            grad_clip_ratio_value = grad_clip_clipped_count / max(grad_clip_total_count, 1)
             beta1 = float(args.adam_beta1)
             beta2 = float(args.adam_beta2)
             wp.launch(
@@ -1120,6 +1120,8 @@ def main() -> None:
                 log_payload["params/batch_active_contact_point_count"] = float(len(batch_active_indices))
                 log_payload["params/batch_piecewise_left_count"] = float(piecewise_side_counts[0])
                 log_payload["params/batch_piecewise_right_count"] = float(piecewise_side_counts[1])
+                log_payload["params/mu_left_mean"] = float(piecewise_side_means[0])
+                log_payload["params/mu_right_mean"] = float(piecewise_side_means[1])
                 log_payload["train/trajectory_loss"] = float(trajectory_loss_value)
                 log_payload["regularization/piecewise"] = float(piecewise_regularization_loss_value)
                 log_payload["regularization/var_left"] = float(piecewise_side_variances[0])
@@ -1142,6 +1144,8 @@ def main() -> None:
                     f"var_left={piecewise_side_variances[0]:.6g} "
                     f"var_right={piecewise_side_variances[1]:.6g} "
                     f"piecewise_contrib={piecewise_regularization_contribution_value:.6g} "
+                    f"mu_left_mean={piecewise_side_means[0]:.6f} "
+                    f"mu_right_mean={piecewise_side_means[1]:.6f} "
                     f"pos={position_loss_value:.6f} "
                     f"ori={orientation_loss_value:.6f} "
                     f"linvel={linear_velocity_loss_value:.6f} "
@@ -1182,7 +1186,7 @@ def main() -> None:
         final_piecewise_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
         (
             final_piecewise_regularization_loss,
-            _,
+            final_piecewise_side_means,
             _,
             _,
             final_piecewise_side_variances,
@@ -1243,6 +1247,8 @@ def main() -> None:
             wandb_run.summary["mu_std"] = float(best_active_params.std())
             wandb_run.summary["mu_min"] = float(best_active_params.min())
             wandb_run.summary["mu_max"] = float(best_active_params.max())
+            wandb_run.summary["mu_left_mean"] = float(final_piecewise_side_means[0])
+            wandb_run.summary["mu_right_mean"] = float(final_piecewise_side_means[1])
             wandb_run.summary["results_path"] = str(args.results_path.resolve())
             wandb_run.summary["point_cloud_path"] = str(args.point_cloud_path.resolve())
             if args.scene_usd_path is not None:
@@ -1259,6 +1265,8 @@ def main() -> None:
         log_message(f"final_piecewise_var_left={final_piecewise_side_variances[0]:.6g}")
         log_message(f"final_piecewise_var_right={final_piecewise_side_variances[1]:.6g}")
         log_message(f"final_piecewise_regularization_contribution={final_piecewise_regularization_contribution:.6g}")
+        log_message(f"final_mu_left_mean={final_piecewise_side_means[0]:.6f}")
+        log_message(f"final_mu_right_mean={final_piecewise_side_means[1]:.6f}")
         log_message(f"final_position_loss={final_position_loss_contribution:.6f}")
         log_message(f"final_orientation_loss={final_orientation_loss_contribution:.6f}")
         log_message(f"final_linear_velocity_loss={final_linear_velocity_loss_contribution:.6f}")
