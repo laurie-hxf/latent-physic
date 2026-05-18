@@ -79,7 +79,6 @@ def build_wandb_log_payload(
     grad_value: np.ndarray | None,
     active_params: np.ndarray | None = None,
     active_indices: np.ndarray,
-    grad_norm_value: float | None = None,
     grad_abs_mean_value: float | None = None,
     grad_abs_max_value: float | None = None,
     mu_mean_value: float | None = None,
@@ -88,11 +87,9 @@ def build_wandb_log_payload(
     mu_max_value: float | None = None,
 ) -> dict[str, float]:
     if grad_value is None:
-        grad_norm = float("nan") if grad_norm_value is None else float(grad_norm_value)
         grad_abs_mean = float("nan") if grad_abs_mean_value is None else float(grad_abs_mean_value)
         grad_abs_max = float("nan") if grad_abs_max_value is None else float(grad_abs_max_value)
     else:
-        grad_norm = float(np.linalg.norm(grad_value))
         grad_abs_mean = float(np.mean(np.abs(grad_value)))
         grad_abs_max = float(np.max(np.abs(grad_value)))
 
@@ -117,7 +114,6 @@ def build_wandb_log_payload(
         "loss_raw/orientation": float(raw_orientation_loss_value),
         "loss_raw/linear_velocity": float(raw_linear_velocity_loss_value),
         "loss_raw/angular_velocity": float(raw_angular_velocity_loss_value),
-        "train/grad_norm": grad_norm,
         "params/contact_point_count": float(len(active_indices)),
         "params/mu_mean": mu_mean,
         "params/mu_std": mu_std,

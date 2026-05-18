@@ -185,6 +185,44 @@ def compute_batch_active_point_indices(
     return np.flatnonzero(batch_active_mask).astype(np.int32)
 
 
+def compute_piecewise_side_ids(local_surface_points: np.ndarray, active_indices: np.ndarray) -> np.ndarray:
+    local_x = np.asarray(local_surface_points, dtype=np.float32)[np.asarray(active_indices, dtype=np.int32), 0]
+    side_ids = np.full(len(local_x), -1, dtype=np.int32)
+    side_ids[local_x < 0.0] = 0
+    side_ids[local_x > 0.0] = 1
+    return side_ids
+
+
+def compute_piecewise_regularization_loss_np(params: np.ndarray, side_ids: np.ndarray) -> float:
+    regularization_loss, _, _, _, _ = compute_piecewise_regularization_inputs_np(params, side_ids)
+    return regularization_loss
+
+
+def compute_piecewise_regularization_inputs_np(
+    params: np.ndarray,
+    side_ids: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    params = np.asarray(params, dtype=np.float64)
+    side_ids = np.asarray(side_ids, dtype=np.int32)
+    side_means = np.zeros(2, dtype=np.float32)
+    side_inv_counts = np.zeros(2, dtype=np.float32)
+    side_counts = np.zeros(2, dtype=np.int32)
+    side_variances = np.zeros(2, dtype=np.float32)
+    regularization_loss = 0.0
+    for side_id in (0, 1):
+        side_params = params[side_ids == side_id]
+        if len(side_params) == 0:
+            continue
+        side_mean = float(np.mean(side_params))
+        side_variance = float(np.mean((side_params - side_mean) ** 2))
+        side_means[side_id] = np.float32(side_mean)
+        side_inv_counts[side_id] = np.float32(1.0 / len(side_params))
+        side_counts[side_id] = len(side_params)
+        side_variances[side_id] = np.float32(side_variance)
+        regularization_loss += side_variance
+    return regularization_loss, side_means, side_inv_counts, side_counts, side_variances
+
+
 def resolve_point_cloud_color_bounds(args: argparse.Namespace) -> tuple[float, float]:
     color_min = args.point_cloud_color_min
     color_max = args.point_cloud_color_max
@@ -487,6 +525,24 @@ def sum_batched_losses_kernel(
 
 
 @wp.kernel
+def add_piecewise_regularization_loss_kernel(
+    params: wp.array(dtype=float),
+    side_ids: wp.array(dtype=wp.int32),
+    side_means: wp.array(dtype=float),
+    side_inv_counts: wp.array(dtype=float),
+    weight: float,
+    batch_loss: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    side_id = side_ids[tid]
+    if side_id < 0 or side_id > 1:
+        return
+
+    delta = params[tid] - side_means[side_id]
+    wp.atomic_add(batch_loss, 0, weight * side_inv_counts[side_id] * delta * delta)
+
+
+@wp.kernel
 def adam_update_kernel(
     params: wp.array(dtype=float),
     grads: wp.array(dtype=wp.float64),
@@ -635,6 +691,10 @@ def sparse_adam_update_clipped_kernel(
 
 def main() -> None:
     args = parse_args()
+    piecewise_regularization_weight = float(args.piecewise_regularization_weight)
+    if piecewise_regularization_weight < 0.0:
+        raise ValueError("--piecewise-regularization-weight must be non-negative.")
+
     startup_time = time.time()
     log_message(f"loading trajectories from {args.trajectory_npz.resolve()}")
     trajectory_collection = load_mujoco_trajectories(args.trajectory_npz, args.max_steps, args.max_trajectories)
@@ -707,6 +767,8 @@ def main() -> None:
     best_active_params = active_params_np.copy()
     rng = np.random.default_rng(int(args.seed))
     start_iteration = 1
+    grad_clip_total_count = 0
+    grad_clip_clipped_count = 0
     if args.resume_checkpoint is not None:
         (
             resume_iteration,
@@ -805,6 +867,10 @@ def main() -> None:
             if np.any(batch_active_param_positions < 0):
                 raise RuntimeError("Batch active points must be a subset of the global active point mask.")
 
+            batch_piecewise_side_ids = compute_piecewise_side_ids(
+                diff_scene.local_surface_points_np,
+                batch_active_indices,
+            )
             batch_active_param_positions_wp = wp.array(
                 batch_active_param_positions,
                 dtype=wp.int32,
@@ -824,6 +890,28 @@ def main() -> None:
                 inputs=[active_params, batch_active_param_positions_wp, buffers.active_point_friction],
                 device=diff_scene.model.device,
             )
+            piecewise_regularization_loss_value = 0.0
+            piecewise_regularization_contribution_value = 0.0
+            (
+                piecewise_regularization_loss_value,
+                piecewise_side_means,
+                piecewise_side_inv_counts,
+                piecewise_side_counts,
+                piecewise_side_variances,
+            ) = compute_piecewise_regularization_inputs_np(
+                buffers.active_point_friction.numpy(),
+                batch_piecewise_side_ids,
+            )
+            piecewise_regularization_contribution_value = (
+                piecewise_regularization_weight * piecewise_regularization_loss_value
+            )
+            batch_piecewise_side_ids_wp = None
+            piecewise_side_means_wp = None
+            piecewise_side_inv_counts_wp = None
+            if piecewise_regularization_weight > 0.0:
+                batch_piecewise_side_ids_wp = wp.array(batch_piecewise_side_ids, dtype=wp.int32, device=device)
+                piecewise_side_means_wp = wp.array(piecewise_side_means, dtype=wp.float32, device=device)
+                piecewise_side_inv_counts_wp = wp.array(piecewise_side_inv_counts, dtype=wp.float32, device=device)
             clear_batched_optimization_grads(buffers)
 
             tape = wp.Tape()
@@ -840,6 +928,20 @@ def main() -> None:
                     combine_batched_loss_components_kernel=combine_batched_loss_components_kernel,
                     sum_batched_losses_kernel=sum_batched_losses_kernel,
                 )
+                if piecewise_regularization_weight > 0.0:
+                    wp.launch(
+                        add_piecewise_regularization_loss_kernel,
+                        dim=len(batch_active_indices),
+                        inputs=[
+                            buffers.active_point_friction,
+                            batch_piecewise_side_ids_wp,
+                            piecewise_side_means_wp,
+                            piecewise_side_inv_counts_wp,
+                            np.float32(piecewise_regularization_weight),
+                            buffers.batch_loss,
+                        ],
+                        device=diff_scene.model.device,
+                    )
             tape.backward(buffers.batch_loss)
 
             if buffers.active_point_friction.grad is None:
@@ -901,7 +1003,8 @@ def main() -> None:
                 )
                 continue
 
-            loss_value = float(scalar_stats_np[0])
+            trajectory_loss_value = float(scalar_stats_np[0])
+            loss_value = trajectory_loss_value + piecewise_regularization_contribution_value
             raw_position_loss_value = float(scalar_stats_np[1])
             raw_orientation_loss_value = float(scalar_stats_np[2])
             raw_linear_velocity_loss_value = float(scalar_stats_np[3])
@@ -917,11 +1020,17 @@ def main() -> None:
             if grad_clip_norm is None or float(grad_clip_norm) <= 0.0 or raw_grad_norm <= float(grad_clip_norm):
                 grad_clip_scale = 1.0
                 clipped_grad_norm = raw_grad_norm
+                grad_was_clipped = False
             else:
                 grad_clip_scale = float(grad_clip_norm) / max(raw_grad_norm, 1.0e-30)
                 clipped_grad_norm = float(grad_clip_norm)
                 grad_abs_mean_value *= grad_clip_scale
                 grad_abs_max_value *= grad_clip_scale
+                grad_was_clipped = True
+            grad_clip_total_count += 1
+            if grad_was_clipped:
+                grad_clip_clipped_count += 1
+            grad_clip_ratio_value = 100.0 * grad_clip_clipped_count / max(grad_clip_total_count, 1)
             beta1 = float(args.adam_beta1)
             beta2 = float(args.adam_beta2)
             wp.launch(
@@ -1001,7 +1110,6 @@ def main() -> None:
                     grad_value=None,
                     active_params=None,
                     active_indices=active_indices,
-                    grad_norm_value=clipped_grad_norm,
                     grad_abs_mean_value=grad_abs_mean_value,
                     grad_abs_max_value=grad_abs_max_value,
                     mu_mean_value=mu_mean_value,
@@ -1010,14 +1118,30 @@ def main() -> None:
                     mu_max_value=mu_max_value,
                 )
                 log_payload["params/batch_active_contact_point_count"] = float(len(batch_active_indices))
+                log_payload["params/batch_piecewise_left_count"] = float(piecewise_side_counts[0])
+                log_payload["params/batch_piecewise_right_count"] = float(piecewise_side_counts[1])
+                log_payload["train/trajectory_loss"] = float(trajectory_loss_value)
+                log_payload["regularization/piecewise"] = float(piecewise_regularization_loss_value)
+                log_payload["regularization/var_left"] = float(piecewise_side_variances[0])
+                log_payload["regularization/var_right"] = float(piecewise_side_variances[1])
+                log_payload["regularization/piecewise_contribution"] = float(
+                    piecewise_regularization_contribution_value
+                )
+                log_payload["regularization/piecewise_weight"] = float(piecewise_regularization_weight)
                 log_payload["train/raw_grad_norm"] = float(raw_grad_norm)
                 log_payload["train/clipped_grad_norm"] = float(clipped_grad_norm)
                 log_payload["train/grad_clip_scale"] = float(grad_clip_scale)
+                log_payload["train/clip_ratio"] = float(grad_clip_ratio_value)
                 wandb_run.log(log_payload, step=iteration)
 
             if iteration == 1 or iteration % max(int(args.log_every), 1) == 0 or iteration == int(args.opt_iters):
                 log_message(
                     f"iter={iteration:04d} loss={loss_value:.6f} "
+                    f"traj_loss={trajectory_loss_value:.6f} "
+                    f"piecewise_reg={piecewise_regularization_loss_value:.6g} "
+                    f"var_left={piecewise_side_variances[0]:.6g} "
+                    f"var_right={piecewise_side_variances[1]:.6g} "
+                    f"piecewise_contrib={piecewise_regularization_contribution_value:.6g} "
                     f"pos={position_loss_value:.6f} "
                     f"ori={orientation_loss_value:.6f} "
                     f"linvel={linear_velocity_loss_value:.6f} "
@@ -1055,6 +1179,21 @@ def main() -> None:
         final_orientation_loss_contribution = float(args.orientation_loss_weight) * final_orientation_loss
         final_linear_velocity_loss_contribution = float(args.linear_velocity_loss_weight) * final_linear_velocity_loss
         final_angular_velocity_loss_contribution = float(args.angular_velocity_loss_weight) * final_angular_velocity_loss
+        final_piecewise_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
+        (
+            final_piecewise_regularization_loss,
+            _,
+            _,
+            _,
+            final_piecewise_side_variances,
+        ) = compute_piecewise_regularization_inputs_np(
+            best_active_params,
+            final_piecewise_side_ids,
+        )
+        final_piecewise_regularization_contribution = (
+            piecewise_regularization_weight * final_piecewise_regularization_loss
+        )
+        final_objective_loss = final_loss + final_piecewise_regularization_contribution
 
         assert_array_finite(
             "best_active_params",
@@ -1083,6 +1222,15 @@ def main() -> None:
             wandb_run.summary["surface_points"] = int(len(diff_scene.local_surface_points_np))
             wandb_run.summary["active_contact_points"] = int(len(active_indices))
             wandb_run.summary["final_loss"] = float(final_loss)
+            wandb_run.summary["final_trajectory_loss"] = float(final_loss)
+            wandb_run.summary["final_objective_loss"] = float(final_objective_loss)
+            wandb_run.summary["final_piecewise_regularization"] = float(final_piecewise_regularization_loss)
+            wandb_run.summary["final_piecewise_var_left"] = float(final_piecewise_side_variances[0])
+            wandb_run.summary["final_piecewise_var_right"] = float(final_piecewise_side_variances[1])
+            wandb_run.summary["final_piecewise_regularization_contribution"] = float(
+                final_piecewise_regularization_contribution
+            )
+            wandb_run.summary["final_piecewise_regularization_weight"] = float(piecewise_regularization_weight)
             wandb_run.summary["final_position_loss"] = float(final_position_loss_contribution)
             wandb_run.summary["final_orientation_loss"] = float(final_orientation_loss_contribution)
             wandb_run.summary["final_linear_velocity_loss"] = float(final_linear_velocity_loss_contribution)
@@ -1106,6 +1254,11 @@ def main() -> None:
         log_message(f"max_steps={trajectory_collection.max_steps} dt={representative_trajectory.timestep:.6f}")
         log_message(f"surface_points={len(diff_scene.local_surface_points_np)} active_contact_points={len(active_indices)}")
         log_message(f"final_loss={final_loss:.6f}")
+        log_message(f"final_objective_loss={final_objective_loss:.6f}")
+        log_message(f"final_piecewise_regularization={final_piecewise_regularization_loss:.6g}")
+        log_message(f"final_piecewise_var_left={final_piecewise_side_variances[0]:.6g}")
+        log_message(f"final_piecewise_var_right={final_piecewise_side_variances[1]:.6g}")
+        log_message(f"final_piecewise_regularization_contribution={final_piecewise_regularization_contribution:.6g}")
         log_message(f"final_position_loss={final_position_loss_contribution:.6f}")
         log_message(f"final_orientation_loss={final_orientation_loss_contribution:.6f}")
         log_message(f"final_linear_velocity_loss={final_linear_velocity_loss_contribution:.6f}")

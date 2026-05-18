@@ -209,6 +209,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linear-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--angular-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument(
+        "--piecewise-regularization-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for x-split piecewise-constant friction regularization. "
+            "The unweighted term is var(mu[x<0]) + var(mu[x>0]) over each batch's active points."
+        ),
+    )
+    parser.add_argument(
         "--point-position-loss-reduction",
         choices=("sum", "mean"),
         default="mean",
