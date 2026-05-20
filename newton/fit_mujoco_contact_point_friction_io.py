@@ -204,6 +204,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adam-eps", type=float, default=1.0e-8)
     parser.add_argument("--min-point-friction", type=float, default=0.0)
     parser.add_argument("--max-point-friction", type=float, default=2.0)
+    parser.add_argument(
+        "--friction-parameterization",
+        choices=("point", "left-right", "global"),
+        default="point",
+        help=(
+            "Friction parameters to optimize. 'point' keeps one parameter per active surface point; "
+            "'left-right' optimizes only two x-split parameters and broadcasts them to all active points; "
+            "'global' optimizes one parameter shared by all active points."
+        ),
+    )
     parser.add_argument("--position-loss-weight", type=float, default=1.0)
     parser.add_argument("--orientation-loss-weight", type=float, default=0.0)
     parser.add_argument("--linear-velocity-loss-weight", type=float, default=0.0)

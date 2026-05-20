@@ -29,6 +29,9 @@ SURFACE_EPS = 1e-6
 DEFAULT_VIDEO_FRAME_STRIDE = 3
 DEFAULT_INIT_X_RANGE = (0.45, 0.70)
 DEFAULT_INIT_Y_RANGE = (-0.12, 0.12)
+DEFAULT_MIN_SLIDING_DISTANCE = 0.02
+DEFAULT_MIN_ROTATION_ANGLE = 0.15
+DEFAULT_MAX_RESAMPLE_ATTEMPTS = 50
 CONTACT_FACE_NORMALS = (
     ("x_neg", np.array([-1.0, 0.0, 0.0], dtype=np.float64)),
     ("x_pos", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
@@ -400,6 +403,68 @@ def trajectory_rows_to_matrix(rows: list[list[float]]) -> np.ndarray:
     return np.asarray(rows, dtype=np.float64).reshape(-1, len(TRAJECTORY_COLUMNS))
 
 
+def quaternion_angle_distance(q0: np.ndarray, q1: np.ndarray) -> float:
+    q0_norm = normalize_vector(np.asarray(q0, dtype=np.float64))
+    q1_norm = normalize_vector(np.asarray(q1, dtype=np.float64))
+    dot = abs(float(np.dot(q0_norm, q1_norm)))
+    return float(2.0 * np.arccos(np.clip(dot, -1.0, 1.0)))
+
+
+def trajectory_motion_metrics(rows: list[list[float]]) -> dict[str, float]:
+    matrix = trajectory_rows_to_matrix(rows)
+    if matrix.shape[0] == 0:
+        return {
+            "net_xy_displacement": 0.0,
+            "max_xy_displacement": 0.0,
+            "xy_path_length": 0.0,
+            "final_rotation_angle": 0.0,
+            "max_rotation_angle": 0.0,
+        }
+
+    positions_xy = matrix[:, 1:3]
+    xy_offsets = positions_xy - positions_xy[0]
+    xy_displacements = np.linalg.norm(xy_offsets, axis=1)
+    xy_steps = np.diff(positions_xy, axis=0)
+    xy_path_length = float(np.linalg.norm(xy_steps, axis=1).sum()) if xy_steps.size else 0.0
+
+    quaternions = matrix[:, 4:8]
+    q0 = quaternions[0]
+    rotation_angles = np.asarray([quaternion_angle_distance(q0, quat) for quat in quaternions], dtype=np.float64)
+
+    return {
+        "net_xy_displacement": float(np.linalg.norm(positions_xy[-1] - positions_xy[0])),
+        "max_xy_displacement": float(xy_displacements.max(initial=0.0)),
+        "xy_path_length": xy_path_length,
+        "final_rotation_angle": float(rotation_angles[-1]),
+        "max_rotation_angle": float(rotation_angles.max(initial=0.0)),
+    }
+
+
+def passes_motion_filter(
+    metrics: dict[str, float],
+    min_sliding_distance: float,
+    min_rotation_angle: float,
+) -> bool:
+    if min_sliding_distance <= 0.0 and min_rotation_angle <= 0.0:
+        return True
+    sliding_ok = min_sliding_distance > 0.0 and metrics["max_xy_displacement"] >= min_sliding_distance
+    rotation_ok = min_rotation_angle > 0.0 and metrics["max_rotation_angle"] >= min_rotation_angle
+    return bool(sliding_ok or rotation_ok)
+
+
+def motion_filter_score(
+    metrics: dict[str, float],
+    min_sliding_distance: float,
+    min_rotation_angle: float,
+) -> float:
+    scores: list[float] = []
+    if min_sliding_distance > 0.0:
+        scores.append(metrics["max_xy_displacement"] / min_sliding_distance)
+    if min_rotation_angle > 0.0:
+        scores.append(metrics["max_rotation_angle"] / min_rotation_angle)
+    return float(max(scores, default=float("inf")))
+
+
 def write_trajectory_npz(npz_path: Path, rows: list[list[float]], metadata: dict[str, object]) -> None:
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     matrix = trajectory_rows_to_matrix(rows)
@@ -730,6 +795,13 @@ def write_batched_dataset_npz(
     recorded_end_time = np.asarray([episode["recorded_end_time"] for episode in episode_metadata], dtype=np.float32)
     final_linear_speed = np.asarray([episode["final_linear_speed"] for episode in episode_metadata], dtype=np.float32)
     final_angular_speed = np.asarray([episode["final_angular_speed"] for episode in episode_metadata], dtype=np.float32)
+    net_xy_displacement = np.asarray([episode["net_xy_displacement"] for episode in episode_metadata], dtype=np.float32)
+    max_xy_displacement = np.asarray([episode["max_xy_displacement"] for episode in episode_metadata], dtype=np.float32)
+    xy_path_length = np.asarray([episode["xy_path_length"] for episode in episode_metadata], dtype=np.float32)
+    final_rotation_angle = np.asarray([episode["final_rotation_angle"] for episode in episode_metadata], dtype=np.float32)
+    max_rotation_angle = np.asarray([episode["max_rotation_angle"] for episode in episode_metadata], dtype=np.float32)
+    motion_filter_passed = np.asarray([episode["motion_filter_passed"] for episode in episode_metadata], dtype=np.bool_)
+    motion_filter_attempts = np.asarray([episode["motion_filter_attempts"] for episode in episode_metadata], dtype=np.int32)
 
     np.savez_compressed(
         dataset_path,
@@ -749,6 +821,13 @@ def write_batched_dataset_npz(
         recorded_end_time=recorded_end_time,
         final_linear_speed=final_linear_speed,
         final_angular_speed=final_angular_speed,
+        net_xy_displacement=net_xy_displacement,
+        max_xy_displacement=max_xy_displacement,
+        xy_path_length=xy_path_length,
+        final_rotation_angle=final_rotation_angle,
+        max_rotation_angle=max_rotation_angle,
+        motion_filter_passed=motion_filter_passed,
+        motion_filter_attempts=motion_filter_attempts,
         episode_metadata_json=np.asarray(json.dumps(episode_metadata, ensure_ascii=False, sort_keys=True)),
         summary_metadata_json=np.asarray(json.dumps(summary_metadata, ensure_ascii=False, sort_keys=True)),
     )
@@ -767,40 +846,122 @@ def generate_dataset(
     renderer = mujoco.Renderer(model, height=720, width=960) if save_any_video else None
     trajectories: list[np.ndarray] = []
     episode_metadata: list[dict[str, object]] = []
+    rejected_motion_attempts = 0
 
     try:
         for episode_id in range(args.num_episodes):
-            reset_scene(model, data)
-            initial_pose = apply_dataset_initial_pose(args, model, data, rng, bounds_min, bounds_max)
-            magnitude = float(rng.uniform(args.force_min, args.force_max))
-            direction = sample_direction(rng, args.dir_z_min, args.dir_z_max)
-            point_offset = sample_point_offset(rng, bounds_min, bounds_max, args.point_edge_margin_ratio)
-            duration = float(rng.uniform(args.duration_min, args.duration_max))
-            force = magnitude * direction
-
             save_episode_video = bool(args.save_episode_videos or episode_id < args.preview_episodes)
-            frames: list[np.ndarray] | None = [] if save_episode_video else None
-            trajectory_rows: list[list[float]] = []
-            result = simulate_force(
-                model,
-                data,
-                force,
-                point_offset,
-                duration,
-                args.total_duration,
-                frames=frames,
-                renderer=renderer,
-                trajectory_rows=trajectory_rows,
-                stop_on_rest=True,
-                video_frame_stride=int(args.video_frame_stride),
-            )
+            max_attempts = int(args.max_resample_attempts) if args.require_motion else 1
+            accepted_rollout: dict[str, object] | None = None
+            best_rollout: dict[str, object] | None = None
+
+            for attempt_id in range(1, max_attempts + 1):
+                reset_scene(model, data)
+                initial_pose = apply_dataset_initial_pose(args, model, data, rng, bounds_min, bounds_max)
+                magnitude = float(rng.uniform(args.force_min, args.force_max))
+                direction = sample_direction(rng, args.dir_z_min, args.dir_z_max)
+                point_offset = sample_point_offset(rng, bounds_min, bounds_max, args.point_edge_margin_ratio)
+                duration = float(rng.uniform(args.duration_min, args.duration_max))
+                force = magnitude * direction
+
+                trajectory_rows: list[list[float]] = []
+                result = simulate_force(
+                    model,
+                    data,
+                    force,
+                    point_offset,
+                    duration,
+                    args.total_duration,
+                    trajectory_rows=trajectory_rows,
+                    stop_on_rest=True,
+                    video_frame_stride=int(args.video_frame_stride),
+                )
+                motion_metrics = trajectory_motion_metrics(trajectory_rows)
+                motion_filter_passed = passes_motion_filter(
+                    motion_metrics,
+                    float(args.min_sliding_distance),
+                    float(args.min_rotation_angle),
+                )
+                motion_score = motion_filter_score(
+                    motion_metrics,
+                    float(args.min_sliding_distance),
+                    float(args.min_rotation_angle),
+                )
+                rollout = {
+                    "attempt_id": attempt_id,
+                    "initial_pose": initial_pose,
+                    "magnitude": magnitude,
+                    "direction": direction,
+                    "point_offset": point_offset,
+                    "duration": duration,
+                    "force": force,
+                    "trajectory_rows": trajectory_rows,
+                    "result": result,
+                    "motion_metrics": motion_metrics,
+                    "motion_filter_passed": motion_filter_passed,
+                    "motion_score": motion_score,
+                }
+
+                if best_rollout is None or motion_score > float(best_rollout["motion_score"]):
+                    best_rollout = rollout
+                if not args.require_motion or motion_filter_passed:
+                    accepted_rollout = rollout
+                    break
+
+                rejected_motion_attempts += 1
+
+            if accepted_rollout is None:
+                assert best_rollout is not None
+                best_metrics = best_rollout["motion_metrics"]
+                raise RuntimeError(
+                    "Could not generate a trajectory satisfying the motion filter "
+                    f"for episode {episode_id} after {max_attempts} attempts. "
+                    f"Best max_xy_displacement={best_metrics['max_xy_displacement']:.6f} m, "
+                    f"best max_rotation_angle={best_metrics['max_rotation_angle']:.6f} rad. "
+                    "Lower --min-sliding-distance/--min-rotation-angle, raise force/duration ranges, "
+                    "or increase --max-resample-attempts."
+                )
+
+            initial_pose = accepted_rollout["initial_pose"]
+            magnitude = float(accepted_rollout["magnitude"])
+            direction = np.asarray(accepted_rollout["direction"], dtype=float)
+            point_offset = np.asarray(accepted_rollout["point_offset"], dtype=float)
+            duration = float(accepted_rollout["duration"])
+            force = np.asarray(accepted_rollout["force"], dtype=float)
+            trajectory_rows = accepted_rollout["trajectory_rows"]
+            result = accepted_rollout["result"]
+            motion_metrics = accepted_rollout["motion_metrics"]
+
             episode_video_path: Path | None = None
-            if frames is not None and frames:
-                output_dir = video_dir if args.save_episode_videos else preview_dir
-                output_dir.mkdir(parents=True, exist_ok=True)
-                episode_video_path = output_dir / f"episode_{episode_id:05d}.mp4"
-                fps = max(1.0, 30.0 * args.playback_speed)
-                write_video(episode_video_path, frames, fps=fps)
+            if save_episode_video:
+                frames: list[np.ndarray] = []
+                replay_rows: list[list[float]] = []
+                reset_scene(model, data)
+                set_block_freejoint_pose(
+                    model,
+                    data,
+                    np.asarray(initial_pose["position"], dtype=float),
+                    np.asarray(initial_pose["quaternion_wxyz"], dtype=float),
+                )
+                simulate_force(
+                    model,
+                    data,
+                    force,
+                    point_offset,
+                    duration,
+                    args.total_duration,
+                    frames=frames,
+                    renderer=renderer,
+                    trajectory_rows=replay_rows,
+                    stop_on_rest=True,
+                    video_frame_stride=int(args.video_frame_stride),
+                )
+                if frames:
+                    output_dir = video_dir if args.save_episode_videos else preview_dir
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    episode_video_path = output_dir / f"episode_{episode_id:05d}.mp4"
+                    fps = max(1.0, 30.0 * args.playback_speed)
+                    write_video(episode_video_path, frames, fps=fps)
 
             trajectories.append(trajectory_rows_to_matrix(trajectory_rows))
             episode_metadata.append(
@@ -833,18 +994,26 @@ def generate_dataset(
                     "final_block_quaternion_world": result["final_block_quaternion_world"].tolist(),
                     "final_linear_speed": float(result["final_linear_speed"]),
                     "final_angular_speed": float(result["final_angular_speed"]),
+                    "motion_filter_passed": bool(accepted_rollout["motion_filter_passed"]),
+                    "motion_filter_attempts": int(accepted_rollout["attempt_id"]),
+                    "motion_filter_score": float(accepted_rollout["motion_score"]),
+                    **motion_metrics,
                     "video_path": str(episode_video_path.resolve()) if episode_video_path is not None else None,
                 }
             )
 
             if (episode_id + 1) % args.progress_every == 0 or episode_id + 1 == args.num_episodes:
                 total_samples = sum(item["recorded_samples"] for item in episode_metadata)
-                print(f"[dataset] completed {episode_id + 1}/{args.num_episodes} episodes ({total_samples} samples)")
+                print(
+                    f"[dataset] completed {episode_id + 1}/{args.num_episodes} episodes "
+                    f"({total_samples} samples, {rejected_motion_attempts} rejected motion attempts)"
+                )
     finally:
         if renderer is not None:
             renderer.close()
 
     total_samples = int(sum(item["recorded_samples"] for item in episode_metadata))
+    motion_filter_attempts = [int(item["motion_filter_attempts"]) for item in episode_metadata]
     summary_metadata = {
         "command": " ".join(shlex.quote(arg) for arg in sys.argv),
         "script_path": str(Path(__file__).resolve()),
@@ -860,6 +1029,13 @@ def generate_dataset(
         "duration_range": [float(args.duration_min), float(args.duration_max)],
         "dir_z_range": [float(args.dir_z_min), float(args.dir_z_max)],
         "point_edge_margin_ratio": float(args.point_edge_margin_ratio),
+        "require_motion": bool(args.require_motion),
+        "min_sliding_distance": float(args.min_sliding_distance),
+        "min_rotation_angle": float(args.min_rotation_angle),
+        "max_resample_attempts": int(args.max_resample_attempts),
+        "rejected_motion_attempts": int(rejected_motion_attempts),
+        "mean_motion_filter_attempts": float(np.mean(motion_filter_attempts)) if motion_filter_attempts else 0.0,
+        "max_motion_filter_attempts": int(max(motion_filter_attempts, default=0)),
         "randomize_initial_pose": bool(args.randomize_initial_pose),
         "init_x_range": [float(args.init_x_min), float(args.init_x_max)],
         "init_y_range": [float(args.init_y_min), float(args.init_y_max)],
@@ -899,6 +1075,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("video-frame-stride must be positive.")
     if args.point_edge_margin_ratio < 0.0 or args.point_edge_margin_ratio >= 0.5:
         raise ValueError("point-edge-margin-ratio must be in [0, 0.5).")
+    if args.min_sliding_distance < 0.0:
+        raise ValueError("min-sliding-distance must be non-negative.")
+    if args.min_rotation_angle < 0.0:
+        raise ValueError("min-rotation-angle must be non-negative.")
+    if args.max_resample_attempts <= 0:
+        raise ValueError("max-resample-attempts must be positive.")
 
     if args.num_episodes > 0:
         if args.init_x_min > args.init_x_max:
@@ -972,6 +1154,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.08,
         help="Relative margin when sampling application points on the block surface.",
+    )
+    parser.add_argument(
+        "--require-motion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In dataset mode, reject sampled rollouts that do not slide or rotate enough.",
+    )
+    parser.add_argument(
+        "--min-sliding-distance",
+        type=float,
+        default=DEFAULT_MIN_SLIDING_DISTANCE,
+        help="Minimum max XY displacement in meters for accepting a dataset rollout.",
+    )
+    parser.add_argument(
+        "--min-rotation-angle",
+        type=float,
+        default=DEFAULT_MIN_ROTATION_ANGLE,
+        help="Minimum max orientation change in radians for accepting a dataset rollout.",
+    )
+    parser.add_argument(
+        "--max-resample-attempts",
+        type=int,
+        default=DEFAULT_MAX_RESAMPLE_ATTEMPTS,
+        help="Maximum sampled rollouts to try per accepted dataset episode when --require-motion is enabled.",
     )
     parser.add_argument(
         "--preview-episodes",

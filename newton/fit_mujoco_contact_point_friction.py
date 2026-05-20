@@ -41,11 +41,13 @@ def save_training_checkpoint(
     iteration: int,
     active_indices: np.ndarray,
     active_params: np.ndarray,
+    optimizer_params: np.ndarray,
     adam_m: np.ndarray,
     adam_v: np.ndarray,
     adam_step: np.ndarray,
     best_loss: float,
     best_active_params: np.ndarray,
+    best_optimizer_params: np.ndarray,
     loss_history: list[float],
     rng: np.random.Generator,
     args: argparse.Namespace,
@@ -56,13 +58,16 @@ def save_training_checkpoint(
         iteration=np.asarray(iteration, dtype=np.int32),
         active_indices=np.asarray(active_indices, dtype=np.int32),
         active_params=np.asarray(active_params, dtype=np.float32),
+        optimizer_params=np.asarray(optimizer_params, dtype=np.float32),
         adam_m=np.asarray(adam_m, dtype=np.float64),
         adam_v=np.asarray(adam_v, dtype=np.float64),
         adam_step=np.asarray(adam_step, dtype=np.int32),
         best_loss=np.asarray(best_loss, dtype=np.float64),
         best_active_params=np.asarray(best_active_params, dtype=np.float32),
+        best_optimizer_params=np.asarray(best_optimizer_params, dtype=np.float32),
         loss_history=np.asarray(loss_history, dtype=np.float32),
         rng_state=np.asarray(rng.bit_generator.state, dtype=object),
+        friction_parameterization=np.asarray(str(args.friction_parameterization)),
         trajectory_npz_path=np.asarray(str(args.trajectory_npz.resolve())),
         max_steps=np.asarray(-1 if args.max_steps is None else int(args.max_steps), dtype=np.int32),
         max_trajectories=np.asarray(-1 if args.max_trajectories is None else int(args.max_trajectories), dtype=np.int32),
@@ -88,11 +93,13 @@ def save_iteration_checkpoint_and_point_cloud(
     iteration: int,
     active_indices: np.ndarray,
     active_params: np.ndarray,
+    optimizer_params: np.ndarray,
     adam_m: np.ndarray,
     adam_v: np.ndarray,
     adam_step: np.ndarray,
     best_loss: float,
     best_active_params: np.ndarray,
+    best_optimizer_params: np.ndarray,
     loss_history: list[float],
     rng: np.random.Generator,
     local_surface_points: np.ndarray,
@@ -104,11 +111,13 @@ def save_iteration_checkpoint_and_point_cloud(
         iteration=iteration,
         active_indices=active_indices,
         active_params=active_params,
+        optimizer_params=optimizer_params,
         adam_m=adam_m,
         adam_v=adam_v,
         adam_step=adam_step,
         best_loss=best_loss,
         best_active_params=best_active_params,
+        best_optimizer_params=best_optimizer_params,
         loss_history=loss_history,
         rng=rng,
         args=args,
@@ -135,6 +144,8 @@ def load_training_checkpoint(
     *,
     checkpoint_path,
     active_indices: np.ndarray,
+    parameterization: str,
+    optimizer_param_shape: tuple[int, ...],
     rng: np.random.Generator,
 ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, list[float]]:
     with np.load(checkpoint_path, allow_pickle=True) as data:
@@ -145,25 +156,42 @@ def load_training_checkpoint(
                 "Use matching trajectory/model/contact-mask settings or start without --resume-checkpoint."
             )
 
+        checkpoint_parameterization = (
+            str(np.asarray(data["friction_parameterization"]).item())
+            if "friction_parameterization" in data.files
+            else "point"
+        )
+        if checkpoint_parameterization != parameterization:
+            raise ValueError(
+                f"{checkpoint_path} was saved with friction_parameterization={checkpoint_parameterization!r}, "
+                f"but the current run uses {parameterization!r}."
+            )
+
         iteration = int(np.asarray(data["iteration"]).item())
-        active_params = np.asarray(data["active_params"], dtype=np.float32)
+        if "optimizer_params" in data.files:
+            active_params = np.asarray(data["optimizer_params"], dtype=np.float32)
+        else:
+            active_params = np.asarray(data["active_params"], dtype=np.float32)
         adam_m = np.asarray(data["adam_m"], dtype=np.float64)
         adam_v = np.asarray(data["adam_v"], dtype=np.float64)
         if "adam_step" in data.files:
             adam_step = np.asarray(data["adam_step"], dtype=np.int32)
         else:
-            adam_step = np.zeros_like(active_indices, dtype=np.int32)
+            adam_step = np.zeros(optimizer_param_shape, dtype=np.int32)
         best_loss = float(np.asarray(data["best_loss"]).item())
-        best_active_params = np.asarray(data["best_active_params"], dtype=np.float32)
+        if "best_optimizer_params" in data.files:
+            best_active_params = np.asarray(data["best_optimizer_params"], dtype=np.float32)
+        else:
+            best_active_params = np.asarray(data["best_active_params"], dtype=np.float32)
         loss_history = [float(value) for value in np.asarray(data["loss_history"], dtype=np.float32)]
 
-        expected_shape = active_indices.shape
+        expected_shape = optimizer_param_shape
         for name, values in (
-            ("active_params", active_params),
+            ("optimizer_params", active_params),
             ("adam_m", adam_m),
             ("adam_v", adam_v),
             ("adam_step", adam_step),
-            ("best_active_params", best_active_params),
+            ("best_optimizer_params", best_active_params),
         ):
             if values.shape != expected_shape:
                 raise ValueError(f"{checkpoint_path} {name} has shape {values.shape}, expected {expected_shape}")
@@ -221,6 +249,104 @@ def compute_piecewise_regularization_inputs_np(
         side_variances[side_id] = np.float32(side_variance)
         regularization_loss += side_variance
     return regularization_loss, side_means, side_inv_counts, side_counts, side_variances
+
+
+def validate_friction_parameterization(parameterization: str) -> str:
+    if parameterization not in {"point", "left-right", "global"}:
+        raise ValueError(f"Unsupported friction parameterization: {parameterization!r}")
+    return parameterization
+
+
+def build_optimizer_param_positions(
+    *,
+    parameterization: str,
+    active_side_ids: np.ndarray,
+    active_count: int,
+) -> tuple[np.ndarray, int]:
+    if parameterization == "point":
+        return np.arange(int(active_count), dtype=np.int32), int(active_count)
+    if parameterization == "global":
+        return np.zeros(int(active_count), dtype=np.int32), 1
+    if np.any(active_side_ids < 0):
+        raise ValueError(
+            "left-right friction parameterization requires every active contact point to have local x != 0. "
+            "Regenerate surface points with the updated sampler so the split seam has no points."
+        )
+    return np.asarray(active_side_ids, dtype=np.int32), 2
+
+
+def expand_optimizer_params_to_active(
+    optimizer_params: np.ndarray,
+    active_param_positions: np.ndarray,
+) -> np.ndarray:
+    params = np.asarray(optimizer_params, dtype=np.float32)
+    positions = np.asarray(active_param_positions, dtype=np.int32)
+    if len(positions) == 0:
+        return np.empty(0, dtype=np.float32)
+    if np.min(positions) < 0 or np.max(positions) >= len(params):
+        raise ValueError("Active parameter positions are outside the optimizer parameter vector.")
+    return params[positions].astype(np.float32, copy=True)
+
+
+def aggregate_optimizer_gradients_np(
+    *,
+    point_grads: np.ndarray,
+    active_param_positions: np.ndarray,
+    optimizer_param_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    grads = np.asarray(point_grads, dtype=np.float64)
+    positions = np.asarray(active_param_positions, dtype=np.int32)
+    if grads.shape != positions.shape:
+        raise ValueError(f"Gradient/position shape mismatch: {grads.shape} vs {positions.shape}")
+    optimizer_grads = np.zeros(int(optimizer_param_count), dtype=np.float64)
+    touched_mask = np.zeros(int(optimizer_param_count), dtype=bool)
+    if len(positions) > 0:
+        if np.min(positions) < 0 or np.max(positions) >= int(optimizer_param_count):
+            raise ValueError("Batch parameter positions are outside the optimizer parameter vector.")
+        np.add.at(optimizer_grads, positions, grads)
+        touched_mask[np.unique(positions)] = True
+    return optimizer_grads, touched_mask
+
+
+def adam_update_np(
+    *,
+    params: np.ndarray,
+    grads: np.ndarray,
+    touched_mask: np.ndarray,
+    first_moment: np.ndarray,
+    second_moment: np.ndarray,
+    adam_step: np.ndarray,
+    grad_scale: float,
+    learning_rate: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    min_value: float,
+    max_value: float,
+) -> None:
+    touched_indices = np.flatnonzero(np.asarray(touched_mask, dtype=bool))
+    for idx in touched_indices:
+        grad = float(grads[idx]) * float(grad_scale)
+        step = int(adam_step[idx]) + 1
+        first_moment[idx] = beta1 * first_moment[idx] + (1.0 - beta1) * grad
+        second_moment[idx] = beta2 * second_moment[idx] + (1.0 - beta2) * (grad * grad)
+        first_hat = first_moment[idx] / max(1.0 - beta1**step, 1.0e-30)
+        second_hat = second_moment[idx] / max(1.0 - beta2**step, 1.0e-30)
+        updated = float(params[idx]) - learning_rate * first_hat / (np.sqrt(second_hat) + eps)
+        params[idx] = np.float32(min(max(updated, min_value), max_value))
+        adam_step[idx] = step
+
+
+def compute_parameter_stats_np(params: np.ndarray) -> tuple[float, float, float, float]:
+    values = np.asarray(params, dtype=np.float64)
+    if len(values) == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    return (
+        float(np.mean(values)),
+        float(np.std(values)),
+        float(np.min(values)),
+        float(np.max(values)),
+    )
 
 
 def resolve_point_cloud_color_bounds(args: argparse.Namespace) -> tuple[float, float]:
@@ -289,6 +415,19 @@ def scatter_active_point_friction_kernel(
     tid = wp.tid()
     point_idx = active_indices[tid]
     full_point_friction[point_idx] = active_point_friction[tid]
+
+
+@wp.kernel
+def scatter_indexed_point_friction_kernel(
+    active_indices: wp.array(dtype=wp.int32),
+    active_param_positions: wp.array(dtype=wp.int32),
+    optimizer_params: wp.array(dtype=float),
+    full_point_friction: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    point_idx = active_indices[tid]
+    param_idx = active_param_positions[tid]
+    full_point_friction[point_idx] = optimizer_params[param_idx]
 
 
 @wp.kernel
@@ -691,6 +830,7 @@ def sparse_adam_update_clipped_kernel(
 
 def main() -> None:
     args = parse_args()
+    parameterization = validate_friction_parameterization(str(args.friction_parameterization))
     piecewise_regularization_weight = float(args.piecewise_regularization_weight)
     if piecewise_regularization_weight < 0.0:
         raise ValueError("--piecewise-regularization-weight must be non-negative.")
@@ -744,6 +884,17 @@ def main() -> None:
         f"active contact points={len(active_indices)} / surface points={len(diff_scene.local_surface_points_np)} "
         f"| startup_elapsed={time.time() - startup_time:.2f}s"
     )
+    active_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
+    active_param_positions, optimizer_param_count = build_optimizer_param_positions(
+        parameterization=parameterization,
+        active_side_ids=active_side_ids,
+        active_count=len(active_indices),
+    )
+    active_param_lookup = np.full(len(diff_scene.local_surface_points_np), -1, dtype=np.int32)
+    active_param_lookup[active_indices] = active_param_positions
+    log_message(
+        f"friction_parameterization={parameterization} optimizer_parameters={optimizer_param_count}"
+    )
     point_cloud_color_min, point_cloud_color_max = resolve_point_cloud_color_bounds(args)
     log_message(
         f"point cloud color range=[{point_cloud_color_min:.6f}, {point_cloud_color_max:.6f}]"
@@ -756,14 +907,14 @@ def main() -> None:
             f"run={wandb_run.name} | mode={args.wandb_mode}"
         )
 
-    active_params_np = np.full(len(active_indices), float(args.point_friction), dtype=np.float32)
-    active_param_lookup = np.full(len(diff_scene.local_surface_points_np), -1, dtype=np.int32)
-    active_param_lookup[active_indices] = np.arange(len(active_indices), dtype=np.int32)
-    adam_m_np = np.zeros(len(active_indices), dtype=np.float64)
-    adam_v_np = np.zeros(len(active_indices), dtype=np.float64)
-    adam_step_np = np.zeros(len(active_indices), dtype=np.int32)
+    optimizer_params_np = np.full(optimizer_param_count, float(args.point_friction), dtype=np.float32)
+    active_params_np = expand_optimizer_params_to_active(optimizer_params_np, active_param_positions)
+    adam_m_np = np.zeros(optimizer_param_count, dtype=np.float64)
+    adam_v_np = np.zeros(optimizer_param_count, dtype=np.float64)
+    adam_step_np = np.zeros(optimizer_param_count, dtype=np.int32)
     loss_history: list[float] = []
     best_loss = float("inf")
+    best_optimizer_params = optimizer_params_np.copy()
     best_active_params = active_params_np.copy()
     rng = np.random.default_rng(int(args.seed))
     start_iteration = 1
@@ -772,18 +923,22 @@ def main() -> None:
     if args.resume_checkpoint is not None:
         (
             resume_iteration,
-            active_params_np,
+            optimizer_params_np,
             adam_m_np,
             adam_v_np,
             adam_step_np,
             best_loss,
-            best_active_params,
+            best_optimizer_params,
             loss_history,
         ) = load_training_checkpoint(
             checkpoint_path=args.resume_checkpoint,
             active_indices=active_indices,
+            parameterization=parameterization,
+            optimizer_param_shape=optimizer_params_np.shape,
             rng=rng,
         )
+        active_params_np = expand_optimizer_params_to_active(optimizer_params_np, active_param_positions)
+        best_active_params = expand_optimizer_params_to_active(best_optimizer_params, active_param_positions)
         start_iteration = resume_iteration + 1
         log_message(
             f"resumed checkpoint {args.resume_checkpoint.resolve()} "
@@ -791,7 +946,8 @@ def main() -> None:
         )
     device = str(diff_scene.torch_device)
     active_indices_wp = wp.array(active_indices, dtype=wp.int32, device=device)
-    active_params = wp.array(active_params_np, dtype=wp.float32, device=device)
+    active_param_positions_wp = wp.array(active_param_positions, dtype=wp.int32, device=device)
+    optimizer_params = wp.array(optimizer_params_np, dtype=wp.float32, device=device)
     adam_m = wp.array(adam_m_np, dtype=wp.float64, device=device)
     adam_v = wp.array(adam_v_np, dtype=wp.float64, device=device)
     adam_step = wp.array(adam_step_np, dtype=wp.int32, device=device)
@@ -805,19 +961,23 @@ def main() -> None:
         dtype=wp.float64,
         device=device,
     )
-    best_active_params_device = wp.array(best_active_params, dtype=wp.float32, device=device)
+    best_optimizer_params_device = wp.array(best_optimizer_params, dtype=wp.float32, device=device)
 
     def sync_best_active_params(*, context: str) -> None:
-        nonlocal best_active_params
-        best_active_params = best_active_params_device.numpy().astype(np.float32)
+        nonlocal best_optimizer_params, best_active_params
+        best_optimizer_params = best_optimizer_params_device.numpy().astype(np.float32)
+        best_active_params = expand_optimizer_params_to_active(best_optimizer_params, active_param_positions)
+        assert_array_finite("best_optimizer_params", best_optimizer_params, context=context)
         assert_array_finite("best_active_params", best_active_params, context=context)
 
     def sync_optimizer_state(*, context: str) -> None:
-        nonlocal active_params_np, adam_m_np, adam_v_np, adam_step_np
-        active_params_np = active_params.numpy().astype(np.float32)
+        nonlocal optimizer_params_np, active_params_np, adam_m_np, adam_v_np, adam_step_np
+        optimizer_params_np = optimizer_params.numpy().astype(np.float32)
+        active_params_np = expand_optimizer_params_to_active(optimizer_params_np, active_param_positions)
         adam_m_np = adam_m.numpy()
         adam_v_np = adam_v.numpy()
         adam_step_np = adam_step.numpy()
+        assert_array_finite("optimizer_params", optimizer_params_np, context=context)
         assert_array_finite("active_params", active_params_np, context=context)
         assert_array_finite("adam_m", adam_m_np, context=context)
         assert_array_finite("adam_v", adam_v_np, context=context)
@@ -830,11 +990,13 @@ def main() -> None:
             iteration=iteration,
             active_indices=active_indices,
             active_params=active_params_np,
+            optimizer_params=optimizer_params_np,
             adam_m=adam_m_np,
             adam_v=adam_v_np,
             adam_step=adam_step_np,
             best_loss=best_loss,
             best_active_params=best_active_params,
+            best_optimizer_params=best_optimizer_params,
             loss_history=loss_history,
             rng=rng,
             local_surface_points=diff_scene.local_surface_points_np,
@@ -879,15 +1041,15 @@ def main() -> None:
             buffers = build_batched_optimization_buffers(diff_scene, batch_trajectories, args, batch_active_indices)
             buffers.full_point_friction.assign(buffers.inactive_point_friction_np)
             wp.launch(
-                scatter_active_point_friction_kernel,
+                scatter_indexed_point_friction_kernel,
                 dim=len(active_indices),
-                inputs=[active_indices_wp, active_params, buffers.full_point_friction],
+                inputs=[active_indices_wp, active_param_positions_wp, optimizer_params, buffers.full_point_friction],
                 device=diff_scene.model.device,
             )
             wp.launch(
                 gather_active_point_friction_kernel,
                 dim=len(batch_active_indices),
-                inputs=[active_params, batch_active_param_positions_wp, buffers.active_point_friction],
+                inputs=[optimizer_params, batch_active_param_positions_wp, buffers.active_point_friction],
                 device=diff_scene.model.device,
             )
             piecewise_regularization_loss_value = 0.0
@@ -1013,9 +1175,27 @@ def main() -> None:
             orientation_loss_value = float(args.orientation_loss_weight) * raw_orientation_loss_value
             linear_velocity_loss_value = float(args.linear_velocity_loss_weight) * raw_linear_velocity_loss_value
             angular_velocity_loss_value = float(args.angular_velocity_loss_weight) * raw_angular_velocity_loss_value
-            raw_grad_norm = float(np.sqrt(max(float(scalar_stats_np[5]), 0.0)))
-            grad_abs_mean_value = float(scalar_stats_np[6]) / max(len(batch_active_indices), 1)
-            grad_abs_max_value = float(scalar_stats_np[7])
+            if parameterization != "point":
+                optimizer_grad_np, optimizer_touched_mask = aggregate_optimizer_gradients_np(
+                    point_grads=buffers.active_point_friction.grad.numpy(),
+                    active_param_positions=batch_active_param_positions,
+                    optimizer_param_count=optimizer_param_count,
+                )
+                touched_grads = optimizer_grad_np[optimizer_touched_mask]
+                if len(touched_grads) == 0:
+                    raw_grad_norm = 0.0
+                    grad_abs_mean_value = 0.0
+                    grad_abs_max_value = 0.0
+                else:
+                    raw_grad_norm = float(np.linalg.norm(touched_grads))
+                    grad_abs_mean_value = float(np.mean(np.abs(touched_grads)))
+                    grad_abs_max_value = float(np.max(np.abs(touched_grads)))
+            else:
+                optimizer_grad_np = None
+                optimizer_touched_mask = None
+                raw_grad_norm = float(np.sqrt(max(float(scalar_stats_np[5]), 0.0)))
+                grad_abs_mean_value = float(scalar_stats_np[6]) / max(len(batch_active_indices), 1)
+                grad_abs_max_value = float(scalar_stats_np[7])
             grad_clip_norm = args.grad_clip_norm
             if grad_clip_norm is None or float(grad_clip_norm) <= 0.0 or raw_grad_norm <= float(grad_clip_norm):
                 grad_clip_scale = 1.0
@@ -1033,65 +1213,104 @@ def main() -> None:
             grad_clip_ratio_value = grad_clip_clipped_count / max(grad_clip_total_count, 1)
             beta1 = float(args.adam_beta1)
             beta2 = float(args.adam_beta2)
-            wp.launch(
-                sparse_adam_update_clipped_kernel,
-                dim=len(batch_active_indices),
-                inputs=[
-                    active_params,
-                    buffers.active_point_friction.grad,
-                    batch_active_param_positions_wp,
-                    adam_m,
-                    adam_v,
-                    adam_step,
-                    beta1_power,
-                    beta2_power,
-                    np.float64(grad_clip_scale),
-                    np.float64(args.learning_rate),
-                    np.float64(beta1),
-                    np.float64(beta2),
-                    np.float64(args.adam_eps),
-                    np.float64(args.min_point_friction),
-                    np.float64(args.max_point_friction),
-                ],
-                device=diff_scene.model.device,
-            )
+            if parameterization != "point":
+                assert optimizer_grad_np is not None
+                assert optimizer_touched_mask is not None
+                adam_update_np(
+                    params=optimizer_params_np,
+                    grads=optimizer_grad_np,
+                    touched_mask=optimizer_touched_mask,
+                    first_moment=adam_m_np,
+                    second_moment=adam_v_np,
+                    adam_step=adam_step_np,
+                    grad_scale=grad_clip_scale,
+                    learning_rate=float(args.learning_rate),
+                    beta1=beta1,
+                    beta2=beta2,
+                    eps=float(args.adam_eps),
+                    min_value=float(args.min_point_friction),
+                    max_value=float(args.max_point_friction),
+                )
+                optimizer_params.assign(optimizer_params_np)
+                adam_m.assign(adam_m_np)
+                adam_v.assign(adam_v_np)
+                adam_step.assign(adam_step_np)
+                beta1_power.assign(np.power(beta1, adam_step_np.astype(np.float64)))
+                beta2_power.assign(np.power(beta2, adam_step_np.astype(np.float64)))
 
-            optimizer_stats = wp.array(
-                np.asarray([0.0, 0.0, np.inf, -np.inf, 0.0, 0.0, 0.0], dtype=np.float64),
-                dtype=wp.float64,
-                device=device,
-            )
-            wp.launch(
-                accumulate_optimizer_scalar_stats_kernel,
-                dim=len(active_indices),
-                inputs=[active_params, adam_m, adam_v, optimizer_stats],
-                device=diff_scene.model.device,
-            )
-            optimizer_stats_np = optimizer_stats.numpy()
-            param_nonfinite_count = int(round(float(optimizer_stats_np[4])))
-            adam_m_nonfinite_count = int(round(float(optimizer_stats_np[5])))
-            adam_v_nonfinite_count = int(round(float(optimizer_stats_np[6])))
-            if param_nonfinite_count != 0 or adam_m_nonfinite_count != 0 or adam_v_nonfinite_count != 0:
-                tape.zero()
-                raise FloatingPointError(
-                    f"iter={iteration:04d} after Adam update: "
-                    f"active_params_nonfinite_count={param_nonfinite_count} "
-                    f"adam_m_nonfinite_count={adam_m_nonfinite_count} "
-                    f"adam_v_nonfinite_count={adam_v_nonfinite_count}"
+                param_nonfinite_count = int(np.count_nonzero(~np.isfinite(optimizer_params_np)))
+                adam_m_nonfinite_count = int(np.count_nonzero(~np.isfinite(adam_m_np)))
+                adam_v_nonfinite_count = int(np.count_nonzero(~np.isfinite(adam_v_np)))
+                if param_nonfinite_count != 0 or adam_m_nonfinite_count != 0 or adam_v_nonfinite_count != 0:
+                    tape.zero()
+                    raise FloatingPointError(
+                        f"iter={iteration:04d} after Adam update: "
+                        f"optimizer_params_nonfinite_count={param_nonfinite_count} "
+                        f"adam_m_nonfinite_count={adam_m_nonfinite_count} "
+                        f"adam_v_nonfinite_count={adam_v_nonfinite_count}"
+                    )
+                active_params_np = expand_optimizer_params_to_active(optimizer_params_np, active_param_positions)
+                mu_mean_value, mu_std_value, mu_min_value, mu_max_value = compute_parameter_stats_np(active_params_np)
+            else:
+                wp.launch(
+                    sparse_adam_update_clipped_kernel,
+                    dim=len(batch_active_indices),
+                    inputs=[
+                        optimizer_params,
+                        buffers.active_point_friction.grad,
+                        batch_active_param_positions_wp,
+                        adam_m,
+                        adam_v,
+                        adam_step,
+                        beta1_power,
+                        beta2_power,
+                        np.float64(grad_clip_scale),
+                        np.float64(args.learning_rate),
+                        np.float64(beta1),
+                        np.float64(beta2),
+                        np.float64(args.adam_eps),
+                        np.float64(args.min_point_friction),
+                        np.float64(args.max_point_friction),
+                    ],
+                    device=diff_scene.model.device,
                 )
 
-            param_count = max(len(active_indices), 1)
-            mu_mean_value = float(optimizer_stats_np[0]) / param_count
-            mu_squares_mean = float(optimizer_stats_np[1]) / param_count
-            mu_std_value = float(np.sqrt(max(mu_squares_mean - mu_mean_value * mu_mean_value, 0.0)))
-            mu_min_value = float(optimizer_stats_np[2])
-            mu_max_value = float(optimizer_stats_np[3])
+                optimizer_stats = wp.array(
+                    np.asarray([0.0, 0.0, np.inf, -np.inf, 0.0, 0.0, 0.0], dtype=np.float64),
+                    dtype=wp.float64,
+                    device=device,
+                )
+                wp.launch(
+                    accumulate_optimizer_scalar_stats_kernel,
+                    dim=optimizer_param_count,
+                    inputs=[optimizer_params, adam_m, adam_v, optimizer_stats],
+                    device=diff_scene.model.device,
+                )
+                optimizer_stats_np = optimizer_stats.numpy()
+                param_nonfinite_count = int(round(float(optimizer_stats_np[4])))
+                adam_m_nonfinite_count = int(round(float(optimizer_stats_np[5])))
+                adam_v_nonfinite_count = int(round(float(optimizer_stats_np[6])))
+                if param_nonfinite_count != 0 or adam_m_nonfinite_count != 0 or adam_v_nonfinite_count != 0:
+                    tape.zero()
+                    raise FloatingPointError(
+                        f"iter={iteration:04d} after Adam update: "
+                        f"optimizer_params_nonfinite_count={param_nonfinite_count} "
+                        f"adam_m_nonfinite_count={adam_m_nonfinite_count} "
+                        f"adam_v_nonfinite_count={adam_v_nonfinite_count}"
+                    )
+
+                param_count = max(optimizer_param_count, 1)
+                mu_mean_value = float(optimizer_stats_np[0]) / param_count
+                mu_squares_mean = float(optimizer_stats_np[1]) / param_count
+                mu_std_value = float(np.sqrt(max(mu_squares_mean - mu_mean_value * mu_mean_value, 0.0)))
+                mu_min_value = float(optimizer_stats_np[2])
+                mu_max_value = float(optimizer_stats_np[3])
             tape.zero()
             loss_history.append(loss_value)
 
             if loss_value < best_loss:
                 best_loss = loss_value
-                best_active_params_device.assign(active_params)
+                best_optimizer_params_device.assign(optimizer_params)
 
             if should_save_iteration_checkpoint(args, iteration):
                 save_iteration_checkpoint(iteration)
@@ -1118,10 +1337,16 @@ def main() -> None:
                     mu_max_value=mu_max_value,
                 )
                 log_payload["params/batch_active_contact_point_count"] = float(len(batch_active_indices))
+                log_payload["params/optimizer_parameter_count"] = float(optimizer_param_count)
                 log_payload["params/batch_piecewise_left_count"] = float(piecewise_side_counts[0])
                 log_payload["params/batch_piecewise_right_count"] = float(piecewise_side_counts[1])
                 log_payload["params/mu_left_mean"] = float(piecewise_side_means[0])
                 log_payload["params/mu_right_mean"] = float(piecewise_side_means[1])
+                if parameterization == "left-right":
+                    log_payload["params/mu_left_param"] = float(optimizer_params_np[0])
+                    log_payload["params/mu_right_param"] = float(optimizer_params_np[1])
+                if parameterization == "global":
+                    log_payload["params/mu_global_param"] = float(optimizer_params_np[0])
                 log_payload["train/trajectory_loss"] = float(trajectory_loss_value)
                 log_payload["regularization/piecewise"] = float(piecewise_regularization_loss_value)
                 log_payload["regularization/var_left"] = float(piecewise_side_variances[0])
@@ -1212,6 +1437,7 @@ def main() -> None:
             diff_scene=diff_scene,
             active_indices=active_indices,
             best_active_params=best_active_params,
+            best_optimizer_params=best_optimizer_params,
             loss_history=loss_history,
             best_loss=best_loss,
             final_loss=final_loss,
@@ -1225,6 +1451,8 @@ def main() -> None:
         if wandb_run is not None:
             wandb_run.summary["surface_points"] = int(len(diff_scene.local_surface_points_np))
             wandb_run.summary["active_contact_points"] = int(len(active_indices))
+            wandb_run.summary["friction_parameterization"] = parameterization
+            wandb_run.summary["optimizer_parameter_count"] = int(optimizer_param_count)
             wandb_run.summary["final_loss"] = float(final_loss)
             wandb_run.summary["final_trajectory_loss"] = float(final_loss)
             wandb_run.summary["final_objective_loss"] = float(final_objective_loss)
@@ -1247,6 +1475,11 @@ def main() -> None:
             wandb_run.summary["mu_std"] = float(best_active_params.std())
             wandb_run.summary["mu_min"] = float(best_active_params.min())
             wandb_run.summary["mu_max"] = float(best_active_params.max())
+            if parameterization == "left-right":
+                wandb_run.summary["mu_left_param"] = float(best_optimizer_params[0])
+                wandb_run.summary["mu_right_param"] = float(best_optimizer_params[1])
+            if parameterization == "global":
+                wandb_run.summary["mu_global_param"] = float(best_optimizer_params[0])
             wandb_run.summary["mu_left_mean"] = float(final_piecewise_side_means[0])
             wandb_run.summary["mu_right_mean"] = float(final_piecewise_side_means[1])
             wandb_run.summary["results_path"] = str(args.results_path.resolve())
@@ -1259,6 +1492,7 @@ def main() -> None:
         log_message(f"trajectory_count={len(trajectories)}")
         log_message(f"max_steps={trajectory_collection.max_steps} dt={representative_trajectory.timestep:.6f}")
         log_message(f"surface_points={len(diff_scene.local_surface_points_np)} active_contact_points={len(active_indices)}")
+        log_message(f"friction_parameterization={parameterization} optimizer_parameters={optimizer_param_count}")
         log_message(f"final_loss={final_loss:.6f}")
         log_message(f"final_objective_loss={final_objective_loss:.6f}")
         log_message(f"final_piecewise_regularization={final_piecewise_regularization_loss:.6g}")
@@ -1267,6 +1501,11 @@ def main() -> None:
         log_message(f"final_piecewise_regularization_contribution={final_piecewise_regularization_contribution:.6g}")
         log_message(f"final_mu_left_mean={final_piecewise_side_means[0]:.6f}")
         log_message(f"final_mu_right_mean={final_piecewise_side_means[1]:.6f}")
+        if parameterization == "left-right":
+            log_message(f"final_mu_left_param={best_optimizer_params[0]:.6f}")
+            log_message(f"final_mu_right_param={best_optimizer_params[1]:.6f}")
+        if parameterization == "global":
+            log_message(f"final_mu_global_param={best_optimizer_params[0]:.6f}")
         log_message(f"final_position_loss={final_position_loss_contribution:.6f}")
         log_message(f"final_orientation_loss={final_orientation_loss_contribution:.6f}")
         log_message(f"final_linear_velocity_loss={final_linear_velocity_loss_contribution:.6f}")

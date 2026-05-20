@@ -92,9 +92,28 @@ def _body_pose_tensor(state: newton.State, body_id: int, device: torch.device, d
     return torch.as_tensor(state.body_q.numpy()[body_id], device=device, dtype=dtype)
 
 
-def _face_centers(half_a: float, half_b: float, spacing: float) -> tuple[np.ndarray, np.ndarray, float]:
-    count_a = max(int(np.ceil((2.0 * half_a) / max(spacing, 1e-6))), 1)
-    count_b = max(int(np.ceil((2.0 * half_b) / max(spacing, 1e-6))), 1)
+def _axis_sample_count(half_extent: float, spacing: float, *, avoid_zero: bool = False) -> int:
+    raw_count = (2.0 * half_extent) / max(spacing, 1.0e-6)
+    nearest_count = int(np.rint(raw_count))
+    if nearest_count >= 1 and np.isclose(raw_count, nearest_count, rtol=1.0e-6, atol=1.0e-8):
+        count = nearest_count
+    else:
+        count = max(int(np.ceil(raw_count)), 1)
+    if avoid_zero and half_extent > 0.0 and count % 2 == 1:
+        count += 1
+    return count
+
+
+def _face_centers(
+    half_a: float,
+    half_b: float,
+    spacing: float,
+    *,
+    avoid_zero_a: bool = False,
+    avoid_zero_b: bool = False,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    count_a = _axis_sample_count(half_a, spacing, avoid_zero=avoid_zero_a)
+    count_b = _axis_sample_count(half_b, spacing, avoid_zero=avoid_zero_b)
     step_a = (2.0 * half_a) / count_a
     step_b = (2.0 * half_b) / count_b
     coords_a = -half_a + (np.arange(count_a, dtype=np.float32) + 0.5) * step_a
@@ -116,8 +135,8 @@ def sample_box_surface_points(
     masses: list[float] = []
 
     yz_y, yz_z, yz_area = _face_centers(hy, hz, spacing)
-    xz_x, xz_z, xz_area = _face_centers(hx, hz, spacing)
-    xy_x, xy_y, xy_area = _face_centers(hx, hy, spacing)
+    xz_x, xz_z, xz_area = _face_centers(hx, hz, spacing, avoid_zero_a=True)
+    xy_x, xy_y, xy_area = _face_centers(hx, hy, spacing, avoid_zero_a=True)
 
     for face_x in (-hx, hx):
         point_mass = surface_density * yz_area
@@ -141,6 +160,8 @@ def sample_box_surface_points(
                 masses.append(point_mass)
 
     local_points = np.asarray(positions, dtype=np.float32)
+    if hx > 0.0 and np.any(np.isclose(local_points[:, 0], 0.0, atol=1.0e-9)):
+        raise RuntimeError("surface-point sampling generated local x=0 points")
     point_masses = np.asarray(masses, dtype=np.float32)
     point_masses *= float(total_mass) / max(float(point_masses.sum()), 1e-8)
     return local_points, point_masses

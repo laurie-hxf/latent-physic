@@ -1,6 +1,7 @@
 git config --global user.name "laurie-hxf"
 git config --global user.email "1847238294@qq.com"
 apt update && apt install procps -y
+apt install ripgrep -y
 # export UV_CACHE_DIR=/workspace/.cache/uv
 # # 假设 PVC 挂载在 /workspace
 # export UV_INSTALL_DIR=/workspace/.local/bin
@@ -35,7 +36,7 @@ node -v # Should print "v24.15.0".
 
 # Verify npm version:
 npm -v # Should print "11.12.1".
-npm i -g ccman
+# npm i -g ccman
 npm i -g @openai/codex
-ccman gmn
+# ccman gmn
 fi
