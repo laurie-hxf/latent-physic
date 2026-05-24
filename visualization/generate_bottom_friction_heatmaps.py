@@ -17,6 +17,9 @@ import numpy as np
 
 
 AXES = ("x", "y", "z")
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+DEFAULT_OUTPUTS_ROOT = ROOT / "outputs"
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,19 +30,38 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
+        "experiment_name_arg",
+        nargs="?",
+        help="Experiment name under --outputs-root. Equivalent to --experiment-name.",
+    )
+    parser.add_argument(
+        "--experiment-name",
+        type=str,
+        default=None,
+        help="Experiment name under --outputs-root. Outputs default to outputs/<name>/heatmap.",
+    )
+    parser.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=None,
+        help="Experiment directory. Defaults to <outputs-root>/<experiment-name>.",
+    )
+    parser.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
+    parser.add_argument(
         "--input",
         nargs="+",
-        default=["iter_*.ply"],
+        default=None,
         help=(
             "Input PLY file path(s), glob(s), or directory path(s). "
-            "Directories are scanned non-recursively for *.ply / *.PLY. "
-            "Default: iter_*.ply"
+            "Directories are scanned non-recursively for *.ply / *.PLY. Defaults to the experiment's "
+            "checkpoint point-cloud directory when --experiment-name is set, otherwise iter_*.ply."
         ),
     )
     parser.add_argument(
         "--output",
-        default="bottom_friction_heatmaps",
-        help="Output directory. Default: bottom_friction_heatmaps",
+        type=Path,
+        default=None,
+        help="Output directory. Defaults to outputs/<experiment-name>/heatmap, otherwise bottom_friction_heatmaps.",
     )
     parser.add_argument(
         "--axis",
@@ -103,7 +125,55 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help=argparse.SUPPRESS,
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.experiment_name is None and args.experiment_name_arg is not None:
+        args.experiment_name = args.experiment_name_arg
+    attach_experiment_paths(args, parser)
+    return args
+
+
+def attach_experiment_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.experiment_dir is not None and args.experiment_name is None:
+        args.experiment_name = args.experiment_dir.name
+    elif args.experiment_name is not None and args.experiment_dir is None:
+        args.experiment_dir = args.outputs_root / args.experiment_name
+
+    if args.experiment_name is None:
+        if args.input is None:
+            args.input = ["iter_*.ply"]
+        if args.output is None:
+            args.output = Path("bottom_friction_heatmaps")
+        return
+
+    experiment_dir = Path(args.experiment_dir)
+    if not experiment_dir.name:
+        parser.error("--experiment-dir must include a directory name.")
+    if not experiment_dir.is_dir():
+        parser.error(f"experiment directory does not exist: {experiment_dir}")
+
+    if args.input is None:
+        preferred_point_cloud_dir = experiment_dir / f"{args.experiment_name}_point_clouds"
+        legacy_point_cloud_dirs = sorted(
+            path
+            for path in experiment_dir.iterdir()
+            if path.is_dir() and "point_cloud" in path.name
+        )
+        final_point_cloud = experiment_dir / f"{args.experiment_name}.ply"
+
+        if preferred_point_cloud_dir.is_dir():
+            args.input = [str(preferred_point_cloud_dir)]
+        elif legacy_point_cloud_dirs:
+            args.input = [str(legacy_point_cloud_dirs[0])]
+        elif final_point_cloud.is_file():
+            args.input = [str(final_point_cloud)]
+        else:
+            parser.error(
+                "could not find experiment point-cloud inputs. Expected one of "
+                f"{preferred_point_cloud_dir}, another *point_cloud* directory, or {final_point_cloud}."
+            )
+
+    if args.output is None:
+        args.output = experiment_dir / "heatmap"
 
 
 def surface_label(axis: str, side: str) -> str:

@@ -7,3 +7,9 @@
 output/
 outputs/
 wandb/
+AGENTS.md
+debug-stash/
+report_assets/
+__pycache__/
+eval/
+friction_baseline_report.html

@@ -91,7 +91,7 @@ def build_batched_optimization_buffers(
     )
 
     step_forces = np.zeros((batch_size, max(max_steps, 1), 3), dtype=np.float32)
-    step_application_points = np.zeros((batch_size, max(max_steps, 1), 3), dtype=np.float32)
+    force_point_offsets_local = np.zeros((batch_size, 3), dtype=np.float32)
     target_positions = np.zeros((batch_size, max(max_frames, 1), 3), dtype=np.float32)
     target_quaternions = np.zeros((batch_size, max(max_frames, 1), 4), dtype=np.float32)
     target_linear_velocity = np.zeros((batch_size, max(max_frames, 1), 3), dtype=np.float32)
@@ -103,7 +103,7 @@ def build_batched_optimization_buffers(
 
     for batch_idx, trajectory in enumerate(trajectories):
         step_forces[batch_idx] = _pad_vec3_rows(trajectory.step_forces, max(max_steps, 1))
-        step_application_points[batch_idx] = _pad_vec3_rows(trajectory.step_application_points, max(max_steps, 1))
+        force_point_offsets_local[batch_idx] = np.asarray(trajectory.force_point_offset_local, dtype=np.float32).reshape(3)
         target_positions[batch_idx] = _pad_vec3_rows(trajectory.positions, max(max_frames, 1))
         target_quaternions[batch_idx] = _pad_vec4_rows(trajectory.quaternions_xyzw, max(max_frames, 1))
         target_linear_velocity[batch_idx] = _pad_vec3_rows(trajectory.linear_velocity, max(max_frames, 1))
@@ -125,7 +125,7 @@ def build_batched_optimization_buffers(
         contact_weighted_masses=wp.zeros(contact_step_capacity * batch_size * point_count, dtype=wp.float32, device=device),
         contact_weighted_mass_total=wp.zeros(contact_step_capacity * batch_size, dtype=wp.float32, device=device),
         step_forces=wp.array(step_forces.reshape(-1, 3), dtype=wp.vec3, device=device),
-        step_application_points=wp.array(step_application_points.reshape(-1, 3), dtype=wp.vec3, device=device),
+        force_point_offsets_local=wp.array(force_point_offsets_local, dtype=wp.vec3, device=device),
         initial_positions=wp.array(initial_positions, dtype=wp.vec3, device=device),
         initial_quaternions=wp.array(initial_quaternions, dtype=wp.quat, device=device),
         initial_linear_velocity=wp.array(initial_linear_velocity, dtype=wp.vec3, device=device),
@@ -335,7 +335,7 @@ def forward_rollout_with_batched_trajectory_loss(
                 buffers.contact_weighted_mass_total,
                 buffers.full_point_friction,
                 buffers.step_forces,
-                buffers.step_application_points,
+                buffers.force_point_offsets_local,
                 buffers.trajectory_step_counts,
                 buffers.batch_size,
                 point_count,

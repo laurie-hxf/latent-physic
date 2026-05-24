@@ -271,6 +271,7 @@ def build_diff_scene(args: argparse.Namespace) -> DiffScene:
         half_extents=box_half_extents,
         spacing=float(args.surface_point_spacing),
         total_mass=float(args.box_mass),
+        avoid_zero_x=bool(getattr(args, "avoid_zero_surface_point_x", True)),
     )
     total_mass, local_com, inertia = compute_mass_properties(local_surface_points_np, point_masses_np)
 

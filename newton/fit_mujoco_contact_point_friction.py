@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -21,7 +24,6 @@ from fit_mujoco_contact_point_friction_runtime import (
     assert_array_finite,
     build_batched_optimization_buffers,
     clear_batched_optimization_grads,
-    evaluate_collection_loss_in_batches,
     forward_rollout_with_batched_trajectory_loss,
     log_message,
     resolve_batch_size,
@@ -85,6 +87,62 @@ def resolve_checkpoint_point_cloud_path(args: argparse.Namespace, iteration: int
 def should_save_iteration_checkpoint(args: argparse.Namespace, iteration: int) -> bool:
     checkpoint_every = int(args.checkpoint_every)
     return checkpoint_every > 0 and (iteration % checkpoint_every == 0 or iteration == int(args.opt_iters))
+
+
+def run_post_training_eval(args: argparse.Namespace) -> Path:
+    eval_script = Path(__file__).resolve().parent.parent / "visualization" / "evaluate_mujoco_contact_friction_experiment.py"
+    eval_output_dir = args.eval_output_root / args.experiment_dir.name
+    cmd = [
+        sys.executable,
+        str(eval_script),
+        "--experiment-dir",
+        str(args.experiment_dir),
+        "--eval-dataset",
+        str(args.eval_dataset),
+        "--output-root",
+        str(args.eval_output_root),
+        "--eval-batch-size",
+        str(args.eval_batch_size),
+        "--position-loss-weight",
+        str(args.position_loss_weight),
+        "--orientation-loss-weight",
+        str(args.orientation_loss_weight),
+        "--linear-velocity-loss-weight",
+        str(args.linear_velocity_loss_weight),
+        "--angular-velocity-loss-weight",
+        str(args.angular_velocity_loss_weight),
+        "--point-position-loss-reduction",
+        str(args.point_position_loss_reduction),
+        "--solver-iterations",
+        str(args.solver_iterations),
+        "--contact-stiffness",
+        str(args.contact_stiffness),
+        "--contact-damping",
+        str(args.contact_damping),
+        "--contact-margin",
+        str(args.contact_margin),
+        "--friction-contact-threshold",
+        str(args.friction_contact_threshold),
+        "--contact-mask-threshold",
+        str(args.contact_mask_threshold),
+        "--friction-regularization",
+        str(args.friction_regularization),
+    ]
+    if args.device is not None:
+        cmd.extend(["--device", str(args.device)])
+    if args.max_steps is not None:
+        cmd.extend(["--max-steps", str(args.max_steps)])
+    if args.eval_replay_limit is not None:
+        cmd.extend(["--replay-limit", str(args.eval_replay_limit)])
+    if args.eval_skip_replay:
+        cmd.append("--skip-replay")
+
+    log_message(
+        f"running post-training eval dataset={args.eval_dataset.resolve()} "
+        f"output_dir={eval_output_dir.resolve()}"
+    )
+    subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent), check=True)
+    return eval_output_dir
 
 
 def save_iteration_checkpoint_and_point_cloud(
@@ -489,7 +547,7 @@ def apply_batched_external_and_surface_point_forces_trajectory_kernel(
     total_weighted_mass: wp.array(dtype=float),
     point_friction: wp.array(dtype=float),
     step_forces: wp.array(dtype=wp.vec3),
-    step_application_points: wp.array(dtype=wp.vec3),
+    force_point_offsets_local: wp.array(dtype=wp.vec3),
     trajectory_step_counts: wp.array(dtype=wp.int32),
     batch_size: int,
     point_count: int,
@@ -517,7 +575,7 @@ def apply_batched_external_and_surface_point_forces_trajectory_kernel(
 
     if point_idx == 0:
         external_force = step_forces[step_offset]
-        application_point = step_application_points[step_offset]
+        application_point = wp.transform_point(pose, force_point_offsets_local[batch_idx])
         external_moment_arm = application_point - world_com
         external_torque = wp.cross(external_moment_arm, external_force)
         wp.atomic_add(body_f, body_id, wp.spatial_vector(external_force, external_torque))
@@ -841,17 +899,16 @@ def main() -> None:
     trajectories = trajectory_collection.trajectories
     representative_trajectory = trajectories[0]
     batch_size = resolve_batch_size(args.batch_size, len(trajectories), DEFAULT_TRAIN_BATCH_SIZE)
-    eval_batch_size = resolve_batch_size(args.eval_batch_size, len(trajectories), batch_size)
     args.steps = trajectory_collection.max_steps
     args.dt = representative_trajectory.timestep
     log_message(
         f"loaded {len(trajectories)} trajectories | source={trajectory_collection.source_type} | "
         f"max_steps={trajectory_collection.max_steps} | dt={representative_trajectory.timestep:.6f} | "
-        f"train_batch_size={batch_size} | eval_batch_size={eval_batch_size}"
+        f"train_batch_size={batch_size}"
     )
 
     log_message(f"building diff scene on device={args.device if args.device is not None else 'auto'}")
-    args.batch_capacity = max(batch_size, eval_batch_size, 1)
+    args.batch_capacity = max(batch_size, 1)
     diff_scene = build_diff_scene(args)
     initial_body_q = diff_scene.states[0].body_q.numpy().copy()
     initial_body_qd = diff_scene.states[0].body_qd.numpy().copy()
@@ -1386,28 +1443,6 @@ def main() -> None:
                 )
 
         sync_best_active_params(context="final export")
-        log_message("running final evaluation across the configured trajectory set")
-        final_loss, final_position_loss, final_orientation_loss, final_linear_velocity_loss, final_angular_velocity_loss, body_q_frames = evaluate_collection_loss_in_batches(
-            diff_scene=diff_scene,
-            trajectories=trajectories,
-            args=args,
-            active_indices=active_indices,
-            active_params=best_active_params,
-            initial_body_q=initial_body_q,
-            initial_body_qd=initial_body_qd,
-            eval_batch_size=eval_batch_size,
-            trajectory_progress_every=int(args.trajectory_progress_every),
-            scatter_active_point_friction_kernel=scatter_active_point_friction_kernel,
-            compute_batched_contact_weighted_masses_kernel=compute_batched_contact_weighted_masses_kernel,
-            apply_batched_external_and_surface_point_forces_trajectory_kernel=apply_batched_external_and_surface_point_forces_trajectory_kernel,
-            accumulate_batched_frame_loss_kernel=accumulate_batched_frame_loss_kernel,
-            combine_batched_loss_components_kernel=combine_batched_loss_components_kernel,
-            sum_batched_losses_kernel=sum_batched_losses_kernel,
-        )
-        final_position_loss_contribution = float(args.position_loss_weight) * final_position_loss
-        final_orientation_loss_contribution = float(args.orientation_loss_weight) * final_orientation_loss
-        final_linear_velocity_loss_contribution = float(args.linear_velocity_loss_weight) * final_linear_velocity_loss
-        final_angular_velocity_loss_contribution = float(args.angular_velocity_loss_weight) * final_angular_velocity_loss
         final_piecewise_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
         (
             final_piecewise_regularization_loss,
@@ -1422,7 +1457,6 @@ def main() -> None:
         final_piecewise_regularization_contribution = (
             piecewise_regularization_weight * final_piecewise_regularization_loss
         )
-        final_objective_loss = final_loss + final_piecewise_regularization_contribution
 
         assert_array_finite(
             "best_active_params",
@@ -1440,12 +1474,7 @@ def main() -> None:
             best_optimizer_params=best_optimizer_params,
             loss_history=loss_history,
             best_loss=best_loss,
-            final_loss=final_loss,
-            final_position_loss=final_position_loss,
-            final_orientation_loss=final_orientation_loss,
-            final_linear_velocity_loss=final_linear_velocity_loss,
-            final_angular_velocity_loss=final_angular_velocity_loss,
-            body_q_frames=body_q_frames,
+            body_q_frames=None,
         )
 
         if wandb_run is not None:
@@ -1453,9 +1482,7 @@ def main() -> None:
             wandb_run.summary["active_contact_points"] = int(len(active_indices))
             wandb_run.summary["friction_parameterization"] = parameterization
             wandb_run.summary["optimizer_parameter_count"] = int(optimizer_param_count)
-            wandb_run.summary["final_loss"] = float(final_loss)
-            wandb_run.summary["final_trajectory_loss"] = float(final_loss)
-            wandb_run.summary["final_objective_loss"] = float(final_objective_loss)
+            wandb_run.summary["best_training_loss"] = float(best_loss)
             wandb_run.summary["final_piecewise_regularization"] = float(final_piecewise_regularization_loss)
             wandb_run.summary["final_piecewise_var_left"] = float(final_piecewise_side_variances[0])
             wandb_run.summary["final_piecewise_var_right"] = float(final_piecewise_side_variances[1])
@@ -1463,14 +1490,6 @@ def main() -> None:
                 final_piecewise_regularization_contribution
             )
             wandb_run.summary["final_piecewise_regularization_weight"] = float(piecewise_regularization_weight)
-            wandb_run.summary["final_position_loss"] = float(final_position_loss_contribution)
-            wandb_run.summary["final_orientation_loss"] = float(final_orientation_loss_contribution)
-            wandb_run.summary["final_linear_velocity_loss"] = float(final_linear_velocity_loss_contribution)
-            wandb_run.summary["final_angular_velocity_loss"] = float(final_angular_velocity_loss_contribution)
-            wandb_run.summary["final_raw_position_loss"] = float(final_position_loss)
-            wandb_run.summary["final_raw_orientation_loss"] = float(final_orientation_loss)
-            wandb_run.summary["final_raw_linear_velocity_loss"] = float(final_linear_velocity_loss)
-            wandb_run.summary["final_raw_angular_velocity_loss"] = float(final_angular_velocity_loss)
             wandb_run.summary["mu_mean"] = float(best_active_params.mean())
             wandb_run.summary["mu_std"] = float(best_active_params.std())
             wandb_run.summary["mu_min"] = float(best_active_params.min())
@@ -1493,8 +1512,7 @@ def main() -> None:
         log_message(f"max_steps={trajectory_collection.max_steps} dt={representative_trajectory.timestep:.6f}")
         log_message(f"surface_points={len(diff_scene.local_surface_points_np)} active_contact_points={len(active_indices)}")
         log_message(f"friction_parameterization={parameterization} optimizer_parameters={optimizer_param_count}")
-        log_message(f"final_loss={final_loss:.6f}")
-        log_message(f"final_objective_loss={final_objective_loss:.6f}")
+        log_message(f"best_training_loss={best_loss:.6f}")
         log_message(f"final_piecewise_regularization={final_piecewise_regularization_loss:.6g}")
         log_message(f"final_piecewise_var_left={final_piecewise_side_variances[0]:.6g}")
         log_message(f"final_piecewise_var_right={final_piecewise_side_variances[1]:.6g}")
@@ -1506,14 +1524,15 @@ def main() -> None:
             log_message(f"final_mu_right_param={best_optimizer_params[1]:.6f}")
         if parameterization == "global":
             log_message(f"final_mu_global_param={best_optimizer_params[0]:.6f}")
-        log_message(f"final_position_loss={final_position_loss_contribution:.6f}")
-        log_message(f"final_orientation_loss={final_orientation_loss_contribution:.6f}")
-        log_message(f"final_linear_velocity_loss={final_linear_velocity_loss_contribution:.6f}")
-        log_message(f"final_angular_velocity_loss={final_angular_velocity_loss_contribution:.6f}")
         log_message(f"results_written_to={args.results_path.resolve()}")
         log_message(f"point_cloud_written_to={args.point_cloud_path.resolve()}")
         if args.scene_usd_path is not None:
             log_message(f"scene_usd_written_to={args.scene_usd_path.resolve()}")
+        if args.eval_dataset is not None:
+            eval_output_dir = run_post_training_eval(args)
+            log_message(f"post_training_eval_written_to={eval_output_dir.resolve()}")
+            if wandb_run is not None:
+                wandb_run.summary["post_training_eval_dir"] = str(eval_output_dir.resolve())
     finally:
         if wandb_run is not None:
             wandb_run.finish()

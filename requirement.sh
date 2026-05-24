@@ -36,7 +36,7 @@ node -v # Should print "v24.15.0".
 
 # Verify npm version:
 npm -v # Should print "11.12.1".
-# npm i -g ccman
 npm i -g @openai/codex
+# npm i -g ccman
 # ccman gmn
 fi

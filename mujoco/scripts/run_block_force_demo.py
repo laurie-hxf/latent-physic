@@ -32,6 +32,8 @@ DEFAULT_INIT_Y_RANGE = (-0.12, 0.12)
 DEFAULT_MIN_SLIDING_DISTANCE = 0.02
 DEFAULT_MIN_ROTATION_ANGLE = 0.15
 DEFAULT_MAX_RESAMPLE_ATTEMPTS = 50
+DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "block_force_demo"
+BLOCK_FRICTION_GEOM_NAMES = ("push_block_left", "push_block_right")
 CONTACT_FACE_NORMALS = (
     ("x_neg", np.array([-1.0, 0.0, 0.0], dtype=np.float64)),
     ("x_pos", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
@@ -538,10 +540,17 @@ def simulate_force(
     trajectory_rows: list[list[float]] | None = None,
     stop_on_rest: bool = False,
     video_frame_stride: int = DEFAULT_VIDEO_FRAME_STRIDE,
+    force_schedule: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     body_id = block_body_id(model)
-    force_steps = int(force_duration / model.opt.timestep)
     total_steps = int(total_duration / model.opt.timestep)
+    if force_schedule is None:
+        force_schedule = single_force_schedule(force, force_duration)
+    normalized_schedule, step_forces, force_steps = normalize_force_schedule_segments(
+        force_schedule,
+        float(model.opt.timestep),
+        total_duration,
+    )
     rest_steps = max(1, int(REST_HOLD_TIME / model.opt.timestep))
     rest_counter = 0
     trajectory_closed = False
@@ -553,19 +562,20 @@ def simulate_force(
         data.xfrc_applied[body_id] = 0.0
         applied_force = np.zeros(3, dtype=float)
         if step < force_steps:
+            applied_force = step_forces[step].copy()
+        if np.linalg.norm(applied_force) > 1.0e-12:
             point = block_application_point(model, data, point_offset)
             qfrc = np.zeros(model.nv, dtype=float)
             mujoco.mj_applyFT(
                 model,
                 data,
-                force,
+                applied_force,
                 np.zeros(3, dtype=float),
                 point,
                 body_id,
                 qfrc,
             )
             data.qfrc_applied[:] = qfrc
-            applied_force = force.copy()
         else:
             data.qfrc_applied[:] = 0.0
         mujoco.mj_step(model, data)
@@ -595,6 +605,8 @@ def simulate_force(
         "final_block_quaternion_world": data.xquat[body_id].copy(),
         "final_linear_speed": final_linear_speed,
         "final_angular_speed": final_angular_speed,
+        "force_schedule": normalized_schedule,
+        "force_steps": force_steps,
     }
 
 
@@ -731,6 +743,110 @@ def sample_direction(rng: np.random.Generator, z_min: float, z_max: float) -> np
     return np.array([radial * np.cos(azimuth), radial * np.sin(azimuth), z], dtype=float)
 
 
+def normalize_force_schedule_segments(
+    force_schedule: list[dict[str, object]],
+    timestep: float,
+    total_duration: float,
+) -> tuple[list[dict[str, object]], np.ndarray, int]:
+    total_steps = int(total_duration / timestep)
+    step_forces = np.zeros((total_steps, 3), dtype=np.float64)
+    normalized_segments: list[dict[str, object]] = []
+    cursor_step = 0
+    for segment_index, segment in enumerate(force_schedule):
+        force = np.asarray(segment["force_world"], dtype=np.float64).reshape(3)
+        duration = float(segment["duration"])
+        if duration <= 0.0:
+            raise ValueError("force schedule segment durations must be positive")
+        segment_steps = max(1, int(duration / timestep + 1.0e-9))
+        start_step = cursor_step
+        end_step = min(total_steps, start_step + segment_steps)
+        if end_step > start_step:
+            step_forces[start_step:end_step] = force
+        magnitude = float(np.linalg.norm(force))
+        direction = force / magnitude if magnitude > 1.0e-12 else np.zeros(3, dtype=np.float64)
+        normalized_segments.append(
+            {
+                "segment_index": int(segment_index),
+                "start_step": int(start_step),
+                "end_step": int(end_step),
+                "start_time": float(start_step * timestep),
+                "end_time": float(end_step * timestep),
+                "duration": duration,
+                "force_magnitude": magnitude,
+                "direction_unit": direction.tolist(),
+                "force_world": force.tolist(),
+            }
+        )
+        cursor_step = end_step
+        if cursor_step >= total_steps:
+            break
+    force_steps = int(max((segment["end_step"] for segment in normalized_segments), default=0))
+    return normalized_segments, step_forces, force_steps
+
+
+def single_force_schedule(force: np.ndarray, force_duration: float) -> list[dict[str, object]]:
+    force = np.asarray(force, dtype=np.float64).reshape(3)
+    magnitude = float(np.linalg.norm(force))
+    direction = force / magnitude if magnitude > 1.0e-12 else np.zeros(3, dtype=np.float64)
+    return [
+        {
+            "segment_index": 0,
+            "duration": float(force_duration),
+            "force_magnitude": magnitude,
+            "direction_unit": direction.tolist(),
+            "force_world": force.tolist(),
+        }
+    ]
+
+
+def sample_force_schedule(
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    first_magnitude: float,
+    first_direction: np.ndarray,
+    total_force_duration: float,
+) -> list[dict[str, object]]:
+    segment_count = max(1, int(args.force_segments))
+    segment_duration = float(total_force_duration) / float(segment_count)
+    schedule: list[dict[str, object]] = []
+    for segment_index in range(segment_count):
+        if segment_index == 0:
+            magnitude = float(first_magnitude)
+            direction = np.asarray(first_direction, dtype=np.float64)
+        else:
+            magnitude = float(rng.uniform(args.force_min, args.force_max))
+            direction = sample_direction(rng, args.dir_z_min, args.dir_z_max)
+        force = magnitude * direction
+        schedule.append(
+            {
+                "segment_index": int(segment_index),
+                "duration": segment_duration,
+                "force_magnitude": magnitude,
+                "direction_unit": direction.tolist(),
+                "force_world": force.tolist(),
+            }
+        )
+    return schedule
+
+
+def first_force_segment(force_schedule: list[dict[str, object]]) -> dict[str, object]:
+    if not force_schedule:
+        raise ValueError("force schedule must contain at least one segment")
+    return force_schedule[0]
+
+
+def set_uniform_block_friction(model: mujoco.MjModel, friction_mu: float) -> None:
+    for geom_name in BLOCK_FRICTION_GEOM_NAMES:
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        if geom_id < 0:
+            raise ValueError(f"Could not find geom '{geom_name}' for uniform friction override.")
+        model.geom_friction[geom_id, :] = np.array([float(friction_mu), 0.0, 0.0], dtype=np.float64)
+
+
+def format_friction_tag(friction_mu: float) -> str:
+    return f"{float(friction_mu):.6g}".replace("-", "m").replace(".", "p")
+
+
 def sample_point_offset(
     rng: np.random.Generator,
     bounds_min: np.ndarray,
@@ -802,6 +918,31 @@ def write_batched_dataset_npz(
     max_rotation_angle = np.asarray([episode["max_rotation_angle"] for episode in episode_metadata], dtype=np.float32)
     motion_filter_passed = np.asarray([episode["motion_filter_passed"] for episode in episode_metadata], dtype=np.bool_)
     motion_filter_attempts = np.asarray([episode["motion_filter_attempts"] for episode in episode_metadata], dtype=np.int32)
+    force_schedules = [
+        episode.get("force_schedule") or single_force_schedule(episode["applied_force_world"], episode["force_duration"])
+        for episode in episode_metadata
+    ]
+    max_force_segments = max((len(schedule) for schedule in force_schedules), default=0)
+    force_segment_counts = np.asarray([len(schedule) for schedule in force_schedules], dtype=np.int32)
+    force_schedule_world = np.full((num_episodes, max_force_segments, 3), np.nan, dtype=np.float32)
+    force_schedule_direction_unit = np.full((num_episodes, max_force_segments, 3), np.nan, dtype=np.float32)
+    force_schedule_magnitude = np.full((num_episodes, max_force_segments), np.nan, dtype=np.float32)
+    force_schedule_duration = np.full((num_episodes, max_force_segments), np.nan, dtype=np.float32)
+    force_schedule_start_step = np.full((num_episodes, max_force_segments), -1, dtype=np.int32)
+    force_schedule_end_step = np.full((num_episodes, max_force_segments), -1, dtype=np.int32)
+    for episode_idx, schedule in enumerate(force_schedules):
+        for segment_idx, segment in enumerate(schedule):
+            force_schedule_world[episode_idx, segment_idx] = np.asarray(segment["force_world"], dtype=np.float32)
+            force_schedule_direction_unit[episode_idx, segment_idx] = np.asarray(
+                segment["direction_unit"],
+                dtype=np.float32,
+            )
+            force_schedule_magnitude[episode_idx, segment_idx] = float(segment["force_magnitude"])
+            force_schedule_duration[episode_idx, segment_idx] = float(segment["duration"])
+            if "start_step" in segment:
+                force_schedule_start_step[episode_idx, segment_idx] = int(segment["start_step"])
+            if "end_step" in segment:
+                force_schedule_end_step[episode_idx, segment_idx] = int(segment["end_step"])
 
     np.savez_compressed(
         dataset_path,
@@ -828,9 +969,136 @@ def write_batched_dataset_npz(
         max_rotation_angle=max_rotation_angle,
         motion_filter_passed=motion_filter_passed,
         motion_filter_attempts=motion_filter_attempts,
+        force_segment_counts=force_segment_counts,
+        force_schedule_world=force_schedule_world,
+        force_schedule_direction_unit=force_schedule_direction_unit,
+        force_schedule_magnitude=force_schedule_magnitude,
+        force_schedule_duration=force_schedule_duration,
+        force_schedule_start_step=force_schedule_start_step,
+        force_schedule_end_step=force_schedule_end_step,
         episode_metadata_json=np.asarray(json.dumps(episode_metadata, ensure_ascii=False, sort_keys=True)),
         summary_metadata_json=np.asarray(json.dumps(summary_metadata, ensure_ascii=False, sort_keys=True)),
     )
+
+
+def generate_uniform_friction_datasets(
+    args: argparse.Namespace,
+    source_episode_metadata: list[dict[str, object]],
+    source_summary_metadata: dict[str, object],
+) -> list[tuple[Path, Path]]:
+    written_paths: list[tuple[Path, Path]] = []
+    for friction_mu in args.uniform_friction_mu:
+        tag = format_friction_tag(float(friction_mu))
+        output_dir = args.output_dir.with_name(f"{args.output_dir.name}_uniform_mu_{tag}")
+        output_name = output_dir.name
+        dataset_path = output_dir / f"{output_name}.npz"
+        metadata_path = output_dir / f"{output_name}.json"
+
+        model = mujoco.MjModel.from_xml_path(str(args.scene))
+        set_uniform_block_friction(model, float(friction_mu))
+        data = mujoco.MjData(model)
+        bounds_min, bounds_max = block_local_bounds(model)
+
+        trajectories: list[np.ndarray] = []
+        episode_metadata: list[dict[str, object]] = []
+        for episode_idx, source_episode in enumerate(source_episode_metadata):
+            reset_scene(model, data)
+            initial_position = np.asarray(source_episode["initial_block_position_world"], dtype=np.float64)
+            initial_quaternion = np.asarray(source_episode["initial_block_quaternion_world"], dtype=np.float64)
+            set_block_freejoint_pose(model, data, initial_position, initial_quaternion)
+
+            force_schedule = list(source_episode["force_schedule"])
+            first_segment = first_force_segment(force_schedule)
+            force = np.asarray(first_segment["force_world"], dtype=np.float64)
+            point_offset = np.asarray(source_episode["point_offset_local"], dtype=np.float64)
+            trajectory_rows: list[list[float]] = []
+            result = simulate_force(
+                model,
+                data,
+                force,
+                point_offset,
+                float(source_episode["force_duration"]),
+                float(source_episode["total_duration"]),
+                trajectory_rows=trajectory_rows,
+                stop_on_rest=True,
+                video_frame_stride=int(args.video_frame_stride),
+                force_schedule=force_schedule,
+            )
+            motion_metrics = trajectory_motion_metrics(trajectory_rows)
+            motion_filter_passed = passes_motion_filter(
+                motion_metrics,
+                float(args.min_sliding_distance),
+                float(args.min_rotation_angle),
+            )
+            motion_score = motion_filter_score(
+                motion_metrics,
+                float(args.min_sliding_distance),
+                float(args.min_rotation_angle),
+            )
+
+            trajectories.append(trajectory_rows_to_matrix(trajectory_rows))
+            metadata = dict(source_episode)
+            metadata.update(
+                {
+                    "source_episode_id": int(source_episode["episode_id"]),
+                    "recorded_samples": result["recorded_samples"],
+                    "recorded_end_time": result["recorded_end_time"],
+                    "rest_reached": bool(result["rest_reached"]),
+                    "final_block_position_world": result["final_block_position_world"].tolist(),
+                    "final_block_quaternion_world": result["final_block_quaternion_world"].tolist(),
+                    "final_linear_speed": float(result["final_linear_speed"]),
+                    "final_angular_speed": float(result["final_angular_speed"]),
+                    "motion_filter_passed": bool(motion_filter_passed),
+                    "source_motion_filter_attempts": int(source_episode["motion_filter_attempts"]),
+                    "motion_filter_score": float(motion_score),
+                    **motion_metrics,
+                    "video_path": None,
+                    "source_dataset_path": str(args.dataset_path.resolve()),
+                    "friction_override": {
+                        geom_name: [float(friction_mu), 0.0, 0.0]
+                        for geom_name in BLOCK_FRICTION_GEOM_NAMES
+                    },
+                }
+            )
+            episode_metadata.append(metadata)
+
+            if (episode_idx + 1) % args.progress_every == 0 or episode_idx + 1 == len(source_episode_metadata):
+                print(
+                    f"[uniform-friction mu={float(friction_mu):.6g}] completed "
+                    f"{episode_idx + 1}/{len(source_episode_metadata)} episodes"
+                )
+
+        total_samples = int(sum(item["recorded_samples"] for item in episode_metadata))
+        motion_filter_attempts = [int(item["motion_filter_attempts"]) for item in episode_metadata]
+        summary_metadata = {
+            **source_summary_metadata,
+            "command": " ".join(shlex.quote(arg) for arg in sys.argv),
+            "mode": "dataset_uniform_friction_replay",
+            "source_dataset_path": str(args.dataset_path.resolve()),
+            "source_force_replay": True,
+            "friction_override": {
+                geom_name: [float(friction_mu), 0.0, 0.0]
+                for geom_name in BLOCK_FRICTION_GEOM_NAMES
+            },
+            "total_samples": total_samples,
+            "rejected_motion_attempts": 0,
+            "mean_motion_filter_attempts": float(np.mean(motion_filter_attempts)) if motion_filter_attempts else 0.0,
+            "max_motion_filter_attempts": int(max(motion_filter_attempts, default=0)),
+            "block_local_bounds_min": bounds_min.tolist(),
+            "block_local_bounds_max": bounds_max.tolist(),
+            "preview_dir": None,
+            "save_episode_videos": False,
+            "episode_video_dir": None,
+            "video_count": 0,
+            "dataset_path": str(dataset_path.resolve()),
+            "metadata_path": str(metadata_path.resolve()),
+        }
+        write_batched_dataset_npz(dataset_path, trajectories, episode_metadata, summary_metadata)
+        write_metadata_json(metadata_path, summary_metadata)
+        written_paths.append((dataset_path, metadata_path))
+        print(f"[uniform-friction mu={float(friction_mu):.6g}] dataset_path: {dataset_path}")
+        print(f"[uniform-friction mu={float(friction_mu):.6g}] metadata_path: {metadata_path}")
+    return written_paths
 
 
 def generate_dataset(
@@ -862,7 +1130,8 @@ def generate_dataset(
                 direction = sample_direction(rng, args.dir_z_min, args.dir_z_max)
                 point_offset = sample_point_offset(rng, bounds_min, bounds_max, args.point_edge_margin_ratio)
                 duration = float(rng.uniform(args.duration_min, args.duration_max))
-                force = magnitude * direction
+                force_schedule = sample_force_schedule(rng, args, magnitude, direction, duration)
+                force = np.asarray(first_force_segment(force_schedule)["force_world"], dtype=float)
 
                 trajectory_rows: list[list[float]] = []
                 result = simulate_force(
@@ -875,7 +1144,9 @@ def generate_dataset(
                     trajectory_rows=trajectory_rows,
                     stop_on_rest=True,
                     video_frame_stride=int(args.video_frame_stride),
+                    force_schedule=force_schedule,
                 )
+                normalized_force_schedule = result["force_schedule"]
                 motion_metrics = trajectory_motion_metrics(trajectory_rows)
                 motion_filter_passed = passes_motion_filter(
                     motion_metrics,
@@ -895,6 +1166,7 @@ def generate_dataset(
                     "point_offset": point_offset,
                     "duration": duration,
                     "force": force,
+                    "force_schedule": normalized_force_schedule,
                     "trajectory_rows": trajectory_rows,
                     "result": result,
                     "motion_metrics": motion_metrics,
@@ -928,6 +1200,7 @@ def generate_dataset(
             point_offset = np.asarray(accepted_rollout["point_offset"], dtype=float)
             duration = float(accepted_rollout["duration"])
             force = np.asarray(accepted_rollout["force"], dtype=float)
+            force_schedule = list(accepted_rollout["force_schedule"])
             trajectory_rows = accepted_rollout["trajectory_rows"]
             result = accepted_rollout["result"]
             motion_metrics = accepted_rollout["motion_metrics"]
@@ -955,6 +1228,7 @@ def generate_dataset(
                     trajectory_rows=replay_rows,
                     stop_on_rest=True,
                     video_frame_stride=int(args.video_frame_stride),
+                    force_schedule=force_schedule,
                 )
                 if frames:
                     output_dir = video_dir if args.save_episode_videos else preview_dir
@@ -984,6 +1258,8 @@ def generate_dataset(
                     "force_magnitude": magnitude,
                     "direction_unit": direction.tolist(),
                     "applied_force_world": force.tolist(),
+                    "force_segment_count": len(force_schedule),
+                    "force_schedule": force_schedule,
                     "point_offset_local": point_offset.tolist(),
                     "force_duration": duration,
                     "total_duration": float(args.total_duration),
@@ -1027,6 +1303,8 @@ def generate_dataset(
         "timestep": float(model.opt.timestep),
         "force_range": [float(args.force_min), float(args.force_max)],
         "duration_range": [float(args.duration_min), float(args.duration_max)],
+        "force_segments": int(args.force_segments),
+        "force_schedule_mode": "equal-duration-segments",
         "dir_z_range": [float(args.dir_z_min), float(args.dir_z_max)],
         "point_edge_margin_ratio": float(args.point_edge_margin_ratio),
         "require_motion": bool(args.require_motion),
@@ -1054,9 +1332,12 @@ def generate_dataset(
         "video_count": int(args.num_episodes if args.save_episode_videos else min(args.preview_episodes, args.num_episodes)),
         "dataset_path": str(args.dataset_path.resolve()),
         "metadata_path": str(args.metadata_path.resolve()),
+        "uniform_friction_mus": [float(mu) for mu in args.uniform_friction_mu],
     }
     write_batched_dataset_npz(args.dataset_path, trajectories, episode_metadata, summary_metadata)
     write_metadata_json(args.metadata_path, summary_metadata)
+    if args.uniform_friction_mu:
+        generate_uniform_friction_datasets(args, episode_metadata, summary_metadata)
     return args.dataset_path, args.metadata_path
 
 
@@ -1073,6 +1354,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("preview-episodes must be non-negative.")
     if args.video_frame_stride <= 0:
         raise ValueError("video-frame-stride must be positive.")
+    if args.force_segments <= 0:
+        raise ValueError("force-segments must be positive.")
+    if any(float(mu) < 0.0 for mu in args.uniform_friction_mu):
+        raise ValueError("uniform-friction-mu values must be non-negative.")
+    if args.uniform_friction_mu and args.num_episodes <= 0:
+        raise ValueError("--uniform-friction-mu is only supported in dataset mode (--num-episodes > 0).")
     if args.point_edge_margin_ratio < 0.0 or args.point_edge_margin_ratio >= 0.5:
         raise ValueError("point-edge-margin-ratio must be in [0, 0.5).")
     if args.min_sliding_distance < 0.0:
@@ -1102,9 +1389,33 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Force duration must be positive.")
 
 
+def attach_output_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    output_dir = args.output_dir
+    output_name = output_dir.name
+    if not output_name:
+        parser.error("--output-dir must include a directory name.")
+
+    args.video_path = output_dir / f"{output_name}.mp4"
+    args.trajectory_path = output_dir / f"{output_name}.csv" if args.save_trajectory_csv else None
+    args.dataset_path = output_dir / f"{output_name}.npz"
+    args.metadata_path = output_dir / f"{output_name}.json"
+    args.preview_dir = output_dir / f"{output_name}_previews"
+    args.episode_video_dir = output_dir / f"{output_name}_videos"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply an external force to the block in the MuJoCo scene.")
     parser.add_argument("--scene", type=Path, default=SCENE_PATH, help="Path to the MuJoCo XML scene.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=(
+            "Directory for this MuJoCo run. Output file names are derived from the directory name: "
+            "<name>.npz dataset, <name>.json metadata, <name>_videos/ episode videos, "
+            "<name>_previews/ preview videos, and <name>.mp4 for single headless video."
+        ),
+    )
     parser.add_argument("--force", type=float, default=2.0, help="Force magnitude in Newtons.")
     parser.add_argument("--dir-x", type=float, default=1.0, help="Direction X component.")
     parser.add_argument("--dir-y", type=float, default=0.0, help="Direction Y component.")
@@ -1118,28 +1429,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loop", action="store_true", help="Loop the simulation in the interactive viewer.")
     parser.add_argument("--headless", action="store_true", help="Run without the interactive viewer.")
     parser.add_argument(
-        "--video-path",
-        type=Path,
-        default=ROOT / "outputs" / "block_force_demo.mp4",
-        help="Output video path when running headless.",
-    )
-    parser.add_argument(
-        "--trajectory-path",
-        type=Path,
-        default=None,
-        help="Optional CSV output path for the block trajectory when running a single headless rollout.",
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=Path,
-        default=ROOT / "outputs" / "block_force_trajectory.npz",
-        help="Compressed NumPy export path. In dataset mode this stores the batched training dataset.",
-    )
-    parser.add_argument(
-        "--metadata-path",
-        type=Path,
-        default=ROOT / "outputs" / "block_force_metadata.json",
-        help="JSON path for recording the run inputs and export metadata when running headless.",
+        "--save-trajectory-csv",
+        action="store_true",
+        help="Also write <output-dir>/<name>.csv for a single headless rollout.",
     )
     parser.add_argument("--num-episodes", type=int, default=0, help="If > 0, generate a random training dataset.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for dataset generation.")
@@ -1147,6 +1439,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-max", type=float, default=8.0, help="Maximum sampled force magnitude.")
     parser.add_argument("--duration-min", type=float, default=0.03, help="Minimum sampled force duration.")
     parser.add_argument("--duration-max", type=float, default=0.35, help="Maximum sampled force duration.")
+    parser.add_argument(
+        "--force-segments",
+        type=int,
+        default=1,
+        help=(
+            "Number of consecutive force segments per dataset episode. Segments share one local application "
+            "point, split the sampled force duration equally, and resample magnitude/direction per segment."
+        ),
+    )
     parser.add_argument("--dir-z-min", type=float, default=-0.35, help="Minimum sampled Z component of force direction.")
     parser.add_argument("--dir-z-max", type=float, default=0.35, help="Maximum sampled Z component of force direction.")
     parser.add_argument(
@@ -1186,21 +1487,20 @@ def parse_args() -> argparse.Namespace:
         help="Save preview videos for the first N dataset episodes.",
     )
     parser.add_argument(
-        "--preview-dir",
-        type=Path,
-        default=ROOT / "outputs" / "block_force_dataset_previews",
-        help="Directory for dataset preview videos.",
-    )
-    parser.add_argument(
         "--save-episode-videos",
         action="store_true",
         help="Save a video for every dataset episode.",
     )
     parser.add_argument(
-        "--episode-video-dir",
-        type=Path,
-        default=ROOT / "outputs" / "block_force_dataset_videos",
-        help="Directory for videos written by --save-episode-videos.",
+        "--uniform-friction-mu",
+        type=float,
+        nargs="*",
+        default=[],
+        help=(
+            "Also generate companion datasets with both block geoms set to each supplied sliding friction "
+            "coefficient. These companion datasets replay the same accepted initial poses, force schedules, "
+            "and local force points as the primary dataset."
+        ),
     )
     parser.add_argument(
         "--video-frame-stride",
@@ -1250,7 +1550,9 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Print progress every N dataset episodes.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    attach_output_paths(args, parser)
+    return args
 
 
 def main() -> None:

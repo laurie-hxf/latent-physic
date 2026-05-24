@@ -16,11 +16,22 @@ from fit_mujoco_contact_point_friction import (
     sum_batched_losses_kernel,
 )
 from fit_mujoco_contact_point_friction_io import DEFAULT_TRAJECTORY_NPZ_PATH
-from fit_mujoco_contact_point_friction_runtime import evaluate_collection_loss_in_batches, log_message
+from fit_mujoco_contact_point_friction_runtime import (
+    evaluate_collection_loss_in_batches,
+    log_message,
+)
 from mujoco_contact_friction_fit_utils import MujocoTrajectory, load_mujoco_trajectories
 from newton_surface_points_diff_demo import build_diff_scene
 from pbd_usd import export_scene_usd
 from project_paths import DEFAULT_OUTPUT_DIR
+
+
+def experiment_checkpoint(experiment_name: str) -> Path:
+    return DEFAULT_OUTPUT_DIR / experiment_name / f"{experiment_name}.npz"
+
+
+def experiment_point_cloud(experiment_name: str) -> Path:
+    return DEFAULT_OUTPUT_DIR / experiment_name / f"{experiment_name}.ply"
 
 
 @dataclass
@@ -45,7 +56,9 @@ class ContactFrictionPointCloud:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--checkpoint-path", type=Path, required=True)
+    parser.add_argument("experiment_name_arg", nargs="?", help="Experiment name under outputs/.")
+    parser.add_argument("--experiment-name", type=str, default=None)
+    parser.add_argument("--checkpoint-path", type=Path, default=None)
     parser.add_argument(
         "--trajectory-index",
         type=int,
@@ -122,7 +135,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-damping", type=float, default=50.0)
     parser.add_argument("--contact-margin", type=float, default=1.0e-3)
     parser.add_argument("--friction-regularization", type=float, default=1.0e-3)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.experiment_name is None and args.experiment_name_arg is not None:
+        args.experiment_name = args.experiment_name_arg
+    if args.checkpoint_path is None:
+        if args.experiment_name is None:
+            parser.error("one of --checkpoint-path or --experiment-name is required")
+        args.checkpoint_path = experiment_checkpoint(args.experiment_name)
+    if args.reference_point_cloud is None and args.experiment_name is not None:
+        candidate = experiment_point_cloud(args.experiment_name)
+        if candidate.exists():
+            args.reference_point_cloud = candidate
+    return args
 
 
 def _maybe_scalar_path(data: np.lib.npyio.NpzFile, key: str) -> Path | None:
@@ -335,18 +359,34 @@ def resolve_output_stem(args: argparse.Namespace, checkpoint: CheckpointParamete
     return f"{checkpoint.path.stem}_{param_tag}_traj_{int(args.trajectory_index):04d}"
 
 
-def resolve_output_path(maybe_path: Path | None, suffix: str, stem: str) -> Path:
+def resolve_output_path(
+    maybe_path: Path | None,
+    suffix: str,
+    stem: str,
+    experiment_name: str | None = None,
+) -> Path:
     if maybe_path is not None:
         return maybe_path
+    if experiment_name is not None:
+        return DEFAULT_OUTPUT_DIR / experiment_name / "replay" / f"{stem}{suffix}"
     return DEFAULT_OUTPUT_DIR / f"{stem}{suffix}"
+
+
+def resolve_existing_trajectory_npz_path(path: Path) -> Path:
+    if path.exists():
+        return path
+    organized_path = path.parent / path.stem / path.name
+    if organized_path.exists():
+        return organized_path
+    return path
 
 
 def resolve_trajectory_npz_path(args: argparse.Namespace, checkpoint: CheckpointParameters) -> Path:
     if args.trajectory_npz is not None:
-        return args.trajectory_npz
+        return resolve_existing_trajectory_npz_path(args.trajectory_npz)
     if checkpoint.trajectory_npz_path is not None:
-        return checkpoint.trajectory_npz_path
-    return DEFAULT_TRAJECTORY_NPZ_PATH
+        return resolve_existing_trajectory_npz_path(checkpoint.trajectory_npz_path)
+    return resolve_existing_trajectory_npz_path(DEFAULT_TRAJECTORY_NPZ_PATH)
 
 
 def select_trajectory(trajectory_npz_path: Path, max_steps: int | None, trajectory_index: int) -> MujocoTrajectory:
@@ -377,8 +417,8 @@ def main() -> None:
     trajectory_npz_path = resolve_trajectory_npz_path(args, checkpoint)
     replay_max_steps = checkpoint.max_steps if args.max_steps is None else args.max_steps
     output_stem = resolve_output_stem(args, checkpoint)
-    scene_usd_path = resolve_output_path(args.scene_usd_path, ".usda", output_stem)
-    summary_npz_path = resolve_output_path(args.summary_npz_path, ".npz", output_stem)
+    scene_usd_path = resolve_output_path(args.scene_usd_path, ".usda", output_stem, args.experiment_name)
+    summary_npz_path = resolve_output_path(args.summary_npz_path, ".npz", output_stem, args.experiment_name)
 
     log_message(f"loading checkpoint metadata from {checkpoint.path.resolve()}")
     log_message(f"loading replay trajectory from {trajectory_npz_path.resolve()}")
@@ -543,7 +583,7 @@ def main() -> None:
         target_linear_velocity=trajectory.linear_velocity,
         target_angular_velocity=trajectory.angular_velocity,
         target_step_forces=trajectory.step_forces,
-        target_step_application_points=trajectory.step_application_points,
+        target_force_point_offset_local=trajectory.force_point_offset_local,
         simulated_positions=simulated_positions,
         simulated_quaternions_xyzw=simulated_quaternions_xyzw,
         simulated_body_q=simulated_body_q,

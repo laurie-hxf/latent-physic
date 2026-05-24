@@ -126,6 +126,7 @@ def sample_box_surface_points(
     half_extents: np.ndarray,
     spacing: float,
     total_mass: float,
+    avoid_zero_x: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     hx, hy, hz = [float(v) for v in half_extents]
     surface_area = 8.0 * (hx * hy + hy * hz + hz * hx)
@@ -135,8 +136,8 @@ def sample_box_surface_points(
     masses: list[float] = []
 
     yz_y, yz_z, yz_area = _face_centers(hy, hz, spacing)
-    xz_x, xz_z, xz_area = _face_centers(hx, hz, spacing, avoid_zero_a=True)
-    xy_x, xy_y, xy_area = _face_centers(hx, hy, spacing, avoid_zero_a=True)
+    xz_x, xz_z, xz_area = _face_centers(hx, hz, spacing, avoid_zero_a=avoid_zero_x)
+    xy_x, xy_y, xy_area = _face_centers(hx, hy, spacing, avoid_zero_a=avoid_zero_x)
 
     for face_x in (-hx, hx):
         point_mass = surface_density * yz_area
@@ -160,7 +161,7 @@ def sample_box_surface_points(
                 masses.append(point_mass)
 
     local_points = np.asarray(positions, dtype=np.float32)
-    if hx > 0.0 and np.any(np.isclose(local_points[:, 0], 0.0, atol=1.0e-9)):
+    if avoid_zero_x and hx > 0.0 and np.any(np.isclose(local_points[:, 0], 0.0, atol=1.0e-9)):
         raise RuntimeError("surface-point sampling generated local x=0 points")
     point_masses = np.asarray(masses, dtype=np.float32)
     point_masses *= float(total_mass) / max(float(point_masses.sum()), 1e-8)

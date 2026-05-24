@@ -21,12 +21,7 @@ def export_contact_friction_outputs(
     best_optimizer_params: np.ndarray,
     loss_history: list[float],
     best_loss: float,
-    final_loss: float,
-    final_position_loss: float,
-    final_orientation_loss: float,
-    final_linear_velocity_loss: float,
-    final_angular_velocity_loss: float,
-    body_q_frames: list[np.ndarray],
+    body_q_frames: list[np.ndarray] | None = None,
 ) -> np.ndarray:
     learned_point_friction = np.full(
         len(diff_scene.local_surface_points_np),
@@ -58,7 +53,7 @@ def export_contact_friction_outputs(
         representative_target_linear_velocity=representative_trajectory.linear_velocity,
         representative_target_angular_velocity=representative_trajectory.angular_velocity,
         representative_target_step_forces=representative_trajectory.step_forces,
-        representative_target_step_application_points=representative_trajectory.step_application_points,
+        representative_force_point_offset_local=representative_trajectory.force_point_offset_local,
         local_surface_points=diff_scene.local_surface_points_np,
         point_masses=diff_scene.point_masses_np,
         active_contact_point_indices=active_indices,
@@ -69,11 +64,6 @@ def export_contact_friction_outputs(
         learned_optimizer_friction=np.asarray(best_optimizer_params, dtype=np.float32),
         loss_history=np.asarray(loss_history, dtype=np.float32),
         best_loss=np.asarray(best_loss, dtype=np.float32),
-        final_loss=np.asarray(final_loss, dtype=np.float32),
-        final_position_loss=np.asarray(final_position_loss, dtype=np.float32),
-        final_orientation_loss=np.asarray(final_orientation_loss, dtype=np.float32),
-        final_linear_velocity_loss=np.asarray(final_linear_velocity_loss, dtype=np.float32),
-        final_angular_velocity_loss=np.asarray(final_angular_velocity_loss, dtype=np.float32),
         point_cloud_path=np.asarray(str(args.point_cloud_path)),
     )
 

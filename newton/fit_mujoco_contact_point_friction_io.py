@@ -9,10 +9,7 @@ from project_paths import DEFAULT_OUTPUT_DIR, REPO_ROOT
 
 
 DEFAULT_TRAJECTORY_NPZ_PATH = REPO_ROOT / "mujoco" / "outputs" / "block_force_dataset_2000.npz"
-DEFAULT_CONTACT_FRICTION_RESULTS_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit.npz"
-DEFAULT_CONTACT_FRICTION_CHECKPOINT_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit_checkpoint.npz"
-DEFAULT_CONTACT_FRICTION_SCENE_USD_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit.usda"
-DEFAULT_CONTACT_FRICTION_POINT_CLOUD_PATH = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_point_cloud.ply"
+DEFAULT_CONTACT_FRICTION_EXPERIMENT_DIR = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit"
 DEFAULT_TRAIN_BATCH_SIZE = 64
 DEFAULT_TRAJECTORY_PROGRESS_EVERY = 256
 
@@ -126,9 +123,32 @@ def save_contact_friction_point_cloud(
             )
 
 
+def _attach_experiment_output_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    experiment_dir = args.experiment_dir
+    experiment_name = experiment_dir.name
+    if not experiment_name:
+        parser.error("--experiment-dir must include a directory name.")
+
+    args.checkpoint_path = experiment_dir / f"{experiment_name}.npz"
+    args.results_path = experiment_dir / f"{experiment_name}_results.npz"
+    args.scene_usd_path = experiment_dir / f"{experiment_name}.usda"
+    args.point_cloud_path = experiment_dir / f"{experiment_name}.ply"
+    args.checkpoint_point_cloud_dir = experiment_dir / f"{experiment_name}_point_clouds"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--trajectory-npz", type=Path, default=DEFAULT_TRAJECTORY_NPZ_PATH)
+    parser.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=DEFAULT_CONTACT_FRICTION_EXPERIMENT_DIR,
+        help=(
+            "Directory for this fitting experiment. Output file names are derived from the directory name: "
+            "<name>.npz checkpoint, <name>.ply final point cloud, <name>_point_clouds/ per-checkpoint point clouds, "
+            "<name>_results.npz final result archive, and <name>.usda scene export."
+        ),
+    )
     parser.add_argument("--max-trajectories", type=int, default=None, help="Use only the first N trajectories when the input NPZ is a dataset.")
     parser.add_argument(
         "--batch-size",
@@ -136,21 +156,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TRAIN_BATCH_SIZE,
         help="Trajectories per training iteration. Use <=0 to consume the full dataset each iteration.",
     )
-    parser.add_argument(
-        "--eval-batch-size",
-        type=int,
-        default=None,
-        help="Trajectories per evaluation batch. Defaults to --batch-size.",
-    )
     parser.add_argument("--seed", type=int, default=0, help="Seed used for trajectory minibatch sampling.")
     parser.add_argument(
         "--trajectory-progress-every",
         type=int,
         default=DEFAULT_TRAJECTORY_PROGRESS_EVERY,
-        help="Print trajectory progress every N trajectories during long train/eval passes. Use <=0 to disable.",
+        help="Print trajectory progress every N trajectories during long training passes. Use <=0 to disable.",
     )
-    parser.add_argument("--results-path", type=Path, default=DEFAULT_CONTACT_FRICTION_RESULTS_PATH)
-    parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CONTACT_FRICTION_CHECKPOINT_PATH)
     parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Resume optimizer state from a checkpoint NPZ.")
     parser.add_argument(
         "--checkpoint-every",
@@ -158,17 +170,6 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Save checkpoint every N successful iterations. Use <=0 to disable periodic checkpointing.",
     )
-    parser.add_argument(
-        "--checkpoint-point-cloud-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Directory for per-checkpoint friction point clouds. Defaults to "
-            "<checkpoint-path parent>/<checkpoint stem>_point_clouds."
-        ),
-    )
-    parser.add_argument("--scene-usd-path", type=Path, default=DEFAULT_CONTACT_FRICTION_SCENE_USD_PATH)
-    parser.add_argument("--point-cloud-path", type=Path, default=DEFAULT_CONTACT_FRICTION_POINT_CLOUD_PATH)
     parser.add_argument(
         "--point-cloud-color-min",
         type=float,
@@ -189,6 +190,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-mode", type=str, default="online")
     parser.add_argument("--wandb-dir", type=Path, default=None)
     parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
+    parser.add_argument(
+        "--eval-dataset",
+        type=Path,
+        default=None,
+        help=(
+            "After training and export, run evaluate_mujoco_contact_friction_experiment.py on this dataset. "
+            "Leave unset to skip post-training eval."
+        ),
+    )
+    parser.add_argument("--eval-output-root", type=Path, default=REPO_ROOT / "eval")
+    parser.add_argument("--eval-batch-size", type=int, default=20)
+    parser.add_argument(
+        "--eval-replay-limit",
+        type=int,
+        default=None,
+        help="Limit post-training replay outputs. Defaults to replaying every loaded eval trajectory.",
+    )
+    parser.add_argument("--eval-skip-replay", action="store_true")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-steps", type=int, default=None, help="Use only the first N simulation steps from the MuJoCo trajectory.")
     parser.add_argument("--opt-iters", type=int, default=60)
@@ -261,4 +280,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-point-local", type=float, nargs=3, default=None)
     parser.add_argument("--force-steps", type=int, default=0)
     parser.add_argument("--loss-target-position", type=float, nargs=3, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    _attach_experiment_output_paths(args, parser)
+    return args

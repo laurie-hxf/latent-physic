@@ -21,7 +21,7 @@ class MujocoTrajectory:
     linear_velocity: np.ndarray
     angular_velocity: np.ndarray
     step_forces: np.ndarray
-    step_application_points: np.ndarray
+    force_point_offset_local: np.ndarray
     timestep: float
     metadata: dict
 
@@ -69,7 +69,7 @@ class BatchedOptimizationBuffers:
     contact_weighted_masses: wp.array
     contact_weighted_mass_total: wp.array
     step_forces: wp.array
-    step_application_points: wp.array
+    force_point_offsets_local: wp.array
     initial_positions: wp.array
     initial_quaternions: wp.array
     initial_linear_velocity: wp.array
@@ -104,7 +104,7 @@ def _truncate_trajectory(
     linear_velocity: np.ndarray,
     angular_velocity: np.ndarray,
     applied_force: np.ndarray,
-    application_point: np.ndarray,
+    point_offset_local: np.ndarray,
     metadata: dict,
     max_steps: int | None,
 ) -> MujocoTrajectory:
@@ -119,6 +119,10 @@ def _truncate_trajectory(
         used_steps = min(max(int(max_steps), 1), total_steps)
 
     used_frames = used_steps + 1
+    force_point_offset_local = np.asarray(point_offset_local, dtype=np.float32).reshape(3)
+    if not np.all(np.isfinite(force_point_offset_local)):
+        raise ValueError("point_offset_local must contain finite values")
+
     return MujocoTrajectory(
         time=np.asarray(time[:used_frames], dtype=np.float32),
         positions=np.asarray(positions[:used_frames], dtype=np.float32),
@@ -126,7 +130,7 @@ def _truncate_trajectory(
         linear_velocity=np.asarray(linear_velocity[:used_frames], dtype=np.float32),
         angular_velocity=np.asarray(angular_velocity[:used_frames], dtype=np.float32),
         step_forces=np.asarray(applied_force[1:used_frames], dtype=np.float32),
-        step_application_points=np.asarray(application_point[1:used_frames], dtype=np.float32),
+        force_point_offset_local=force_point_offset_local,
         timestep=timestep,
         metadata=dict(metadata),
     )
@@ -141,6 +145,11 @@ def load_mujoco_trajectory_dataset(
         trajectories = np.asarray(data["trajectories"], dtype=np.float32)
         columns = data["columns"].tolist()
         episode_lengths = np.asarray(data["episode_lengths"], dtype=np.int32)
+        point_offsets_local = (
+            np.asarray(data["point_offset_local"], dtype=np.float32)
+            if "point_offset_local" in data.files
+            else None
+        )
         summary_metadata_json = data["summary_metadata_json"].item() if "summary_metadata_json" in data.files else "{}"
         episode_metadata_json = data["episode_metadata_json"].item() if "episode_metadata_json" in data.files else "[]"
 
@@ -177,9 +186,6 @@ def load_mujoco_trajectory_dataset(
         "force_x",
         "force_y",
         "force_z",
-        "point_x",
-        "point_y",
-        "point_z",
     ]
     missing_columns = [name for name in required_columns if name not in column_to_index]
     if missing_columns:
@@ -203,6 +209,16 @@ def load_mujoco_trajectory_dataset(
             episode_meta = episode_metadata_list[episode_idx]
             if isinstance(episode_meta, dict):
                 metadata.update(episode_meta)
+        point_offset_local = None
+        if point_offsets_local is not None and episode_idx < len(point_offsets_local):
+            point_offset_local = point_offsets_local[episode_idx]
+        elif metadata.get("point_offset_local") is not None:
+            point_offset_local = np.asarray(metadata["point_offset_local"], dtype=np.float32)
+        else:
+            raise ValueError(
+                f"{dataset_npz_path} trajectory {episode_idx} is missing point_offset_local. "
+                "Newton force replay now requires local force application points."
+            )
 
         trajectory_list.append(
             _truncate_trajectory(
@@ -248,14 +264,7 @@ def load_mujoco_trajectory_dataset(
                         column_to_index["force_z"],
                     ],
                 ],
-                application_point=episode_array[
-                    :,
-                    [
-                        column_to_index["point_x"],
-                        column_to_index["point_y"],
-                        column_to_index["point_z"],
-                    ],
-                ],
+                point_offset_local=point_offset_local,
                 metadata=metadata,
                 max_steps=max_steps,
             )

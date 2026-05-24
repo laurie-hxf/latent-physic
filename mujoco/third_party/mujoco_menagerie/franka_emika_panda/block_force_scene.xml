@@ -29,9 +29,9 @@
     <body name="push_block" pos="0.58 0.0 0.025">
       <freejoint/>
       <geom name="push_block_left" type="box" pos="-0.05 0 0" size="0.05 0.05 0.025" condim="3"
-        friction="0.05 0.03 0.003" rgba="0.88 0.28 0.22 1" contype="2" conaffinity="3" solref="0.01 1"/>
+        friction="0.05 0.0 0.0" rgba="0.88 0.28 0.22 1" contype="2" conaffinity="3" solref="0.01 1"/>
       <geom name="push_block_right" type="box" pos="0.05 0 0" size="0.05 0.05 0.025" condim="3"
-        friction="0.55 0.08 0.006" rgba="0.18 0.45 0.95 1" contype="2" conaffinity="3" solref="0.01 1"/>
+        friction="0.55 0.0 0.0" rgba="0.18 0.45 0.95 1" contype="2" conaffinity="3" solref="0.01 1"/>
     </body>
 
     <!-- <body name="push_start" mocap="true" pos="0.58 0.0 0.0">
