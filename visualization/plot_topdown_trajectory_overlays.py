@@ -142,6 +142,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-damping", type=float, default=50.0)
     parser.add_argument("--friction-contact-threshold", type=float, default=0.002)
     parser.add_argument("--contact-mask-threshold", type=float, default=0.002)
+    parser.add_argument("--position-loss-weight", type=float, default=1.0)
+    parser.add_argument("--orientation-loss-weight", type=float, default=0.0)
+    parser.add_argument("--linear-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--angular-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--trajectory-indices", type=int, nargs="*", default=None)
     parser.add_argument(
         "--all-trajectories",
@@ -150,6 +154,12 @@ def parse_args() -> argparse.Namespace:
         help="Plot every trajectory in the dataset unless --trajectory-indices is provided.",
     )
     parser.add_argument("--include-pure-point", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--unified-axis-scale",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use one shared equal-aspect x/y axis range for every subplot.",
+    )
     return parser.parse_args()
 
 
@@ -184,10 +194,10 @@ def make_eval_args(args: argparse.Namespace) -> argparse.Namespace:
         force_magnitude=None,
         force_direction=None,
         force_point=None,
-        position_loss_weight=1.0,
-        orientation_loss_weight=0.0,
-        linear_velocity_loss_weight=0.0,
-        angular_velocity_loss_weight=0.0,
+        position_loss_weight=float(args.position_loss_weight),
+        orientation_loss_weight=float(args.orientation_loss_weight),
+        linear_velocity_loss_weight=float(args.linear_velocity_loss_weight),
+        angular_velocity_loss_weight=float(args.angular_velocity_loss_weight),
         point_position_loss_reduction="mean",
     )
 
@@ -555,6 +565,54 @@ def equalize_axes(ax) -> None:
     ax.set_aspect("equal", adjustable="box")
 
 
+def axis_bounds(all_xy: list[np.ndarray], padding_frac: float = 0.12) -> tuple[float, float, float, float]:
+    stacked = np.concatenate([xy for xy in all_xy if len(xy) > 0], axis=0)
+    x_min = float(np.min(stacked[:, 0]))
+    x_max = float(np.max(stacked[:, 0]))
+    y_min = float(np.min(stacked[:, 1]))
+    y_max = float(np.max(stacked[:, 1]))
+    cx = 0.5 * (x_min + x_max)
+    cy = 0.5 * (y_min + y_max)
+    radius = 0.5 * max(x_max - x_min, y_max - y_min, 1.0e-6)
+    pad = max(radius * float(padding_frac), 0.002)
+    return cx - radius - pad, cx + radius + pad, cy - radius - pad, cy + radius + pad
+
+
+def apply_axis_bounds(ax, bounds: tuple[float, float, float, float]) -> None:
+    x_min, x_max, y_min, y_max = bounds
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_aspect("equal", adjustable="box")
+
+
+def axis_tick_values(v_min: float, v_max: float, count: int = 3) -> list[float]:
+    return [float(value) for value in np.linspace(float(v_min), float(v_max), int(count))]
+
+
+def format_axis_tick(value: float, span: float) -> str:
+    value = 0.0 if abs(float(value)) < 5.0e-8 else float(value)
+    span = abs(float(span))
+    if span < 0.02:
+        return f"{value:.4f}"
+    if span < 0.2:
+        return f"{value:.3f}"
+    if span < 2.0:
+        return f"{value:.2f}"
+    return f"{value:.1f}"
+
+
+def apply_panel_axis_ticks(ax) -> None:
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    x_ticks = axis_tick_values(x0, x1)
+    y_ticks = axis_tick_values(y0, y1)
+    ax.set_xticks(x_ticks)
+    ax.set_yticks(y_ticks)
+    ax.set_xticklabels([format_axis_tick(value, x1 - x0) for value in x_ticks])
+    ax.set_yticklabels([format_axis_tick(value, y1 - y0) for value in y_ticks])
+    ax.tick_params(axis="both", labelsize=7, pad=1)
+
+
 def main() -> None:
     args = parse_args()
     methods = select_methods(args)
@@ -594,7 +652,7 @@ def main() -> None:
 
     cols = 5 if len(selected_indices) > 12 else 3
     rows = int(np.ceil(len(selected_indices) / cols))
-    legend_width = 6.5 if len(methods) > 8 else 2.0
+    legend_width = 7.2 if len(methods) > 1 else 3.0
     fig, axes = plt.subplots(
         rows,
         cols,
@@ -627,6 +685,17 @@ def main() -> None:
         method_positions[method.name] = positions
         method_losses[method.name] = losses
         method_summaries.append(checkpoint_summary(method, checkpoint, losses))
+
+    global_axis_bounds = None
+    if args.unified_axis_scale:
+        global_xy = []
+        for plot_idx, trajectory in enumerate(selected_trajectories):
+            target_xy = np.asarray(trajectory.positions[:, :2], dtype=np.float32)
+            global_xy.append(target_xy)
+            for method in methods:
+                pred_positions = method_positions[method.name][plot_idx]
+                global_xy.append(np.asarray(pred_positions[: len(target_xy), :2], dtype=np.float32))
+        global_axis_bounds = axis_bounds(global_xy)
 
     for plot_idx, trajectory_idx in enumerate(selected_indices):
         ax = axes_flat[plot_idx]
@@ -663,7 +732,11 @@ def main() -> None:
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.grid(alpha=0.22)
-        equalize_axes(ax)
+        if global_axis_bounds is None:
+            equalize_axes(ax)
+        else:
+            apply_axis_bounds(ax, global_axis_bounds)
+        apply_panel_axis_ticks(ax)
         best_method = min(losses, key=losses.get)
         summary_lines.append(
             f"traj={trajectory_idx} episode={meta.get('episode_index', trajectory_idx)} "
@@ -674,29 +747,18 @@ def main() -> None:
         ax.axis("off")
 
     handles, labels = axes_flat[0].get_legend_handles_labels()
-    if len(methods) > 8:
-        fig.legend(
-            handles,
-            labels,
-            loc="center left",
-            bbox_to_anchor=(0.775, 0.5),
-            ncols=1,
-            frameon=False,
-            fontsize=6.2,
-            handlelength=2.6,
-            labelspacing=0.48,
-        )
-        tight_rect = (0, 0.0, 0.77, 0.94)
-    else:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.01),
-            ncols=min(len(labels), 5),
-            frameon=False,
-        )
-        tight_rect = (0, 0.045, 1, 0.94)
+    fig.legend(
+        handles,
+        labels,
+        loc="center left",
+        bbox_to_anchor=(0.765, 0.5),
+        ncols=1,
+        frameon=False,
+        fontsize=6.2 if len(methods) > 4 else 7.0,
+        handlelength=2.6,
+        labelspacing=0.48,
+    )
+    tight_rect = (0, 0.0, 0.755, 0.94)
     max_steps_text = "all steps" if args.max_steps is None else f"max_steps={args.max_steps}"
     fig.suptitle(
         f"Top-down trajectory overlays | {Path(args.dataset).stem} | {len(methods)} checkpoints | {max_steps_text}",
@@ -717,6 +779,7 @@ def main() -> None:
         "eval_batch_size": eval_args.eval_batch_size,
         "contact_stiffness": args.contact_stiffness,
         "surface_point_spacing": args.surface_point_spacing,
+        "unified_axis_scale": bool(args.unified_axis_scale),
         "methods": method_summaries,
         "trajectory_losses": {
             method.name: {

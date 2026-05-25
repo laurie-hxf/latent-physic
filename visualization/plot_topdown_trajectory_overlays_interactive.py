@@ -78,6 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-damping", type=float, default=50.0)
     parser.add_argument("--friction-contact-threshold", type=float, default=0.002)
     parser.add_argument("--contact-mask-threshold", type=float, default=0.002)
+    parser.add_argument("--position-loss-weight", type=float, default=1.0)
+    parser.add_argument("--orientation-loss-weight", type=float, default=0.0)
+    parser.add_argument("--linear-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--angular-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--trajectory-indices", type=int, nargs="*", default=None)
     parser.add_argument(
         "--all-trajectories",
@@ -90,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-height", type=int, default=230)
     parser.add_argument("--legend-width", type=int, default=520)
     parser.add_argument("--axis-padding-frac", type=float, default=0.12)
+    parser.add_argument(
+        "--unified-axis-scale",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use one shared equal-aspect x/y axis range for every panel.",
+    )
     parser.add_argument(
         "--reuse-summary",
         type=Path,
@@ -193,6 +203,22 @@ def axis_bounds(all_xy: list[np.ndarray], padding_frac: float) -> tuple[float, f
     return cx - radius - pad, cx + radius + pad, cy - radius - pad, cy + radius + pad
 
 
+def axis_tick_values(v_min: float, v_max: float, count: int = 3) -> list[float]:
+    return [float(value) for value in np.linspace(float(v_min), float(v_max), int(count))]
+
+
+def format_axis_tick(value: float, span: float) -> str:
+    value = 0.0 if abs(float(value)) < 5.0e-8 else float(value)
+    span = abs(float(span))
+    if span < 0.02:
+        return f"{value:.4f}"
+    if span < 0.2:
+        return f"{value:.3f}"
+    if span < 2.0:
+        return f"{value:.2f}"
+    return f"{value:.1f}"
+
+
 def load_cached_payload(path: Path) -> dict:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if "interactive_data" not in payload:
@@ -287,6 +313,12 @@ def collect_rollout_payload(args: argparse.Namespace) -> dict:
         "eval_batch_size": eval_args.eval_batch_size,
         "contact_stiffness": args.contact_stiffness,
         "surface_point_spacing": args.surface_point_spacing,
+        "loss_weights": {
+            "position": float(args.position_loss_weight),
+            "orientation": float(args.orientation_loss_weight),
+            "linear_velocity": float(args.linear_velocity_loss_weight),
+            "angular_velocity": float(args.angular_velocity_loss_weight),
+        },
         "methods": method_summaries,
         "reference_datasets": [str(path) for path in (args.reference_dataset or [])],
         "trajectory_losses": {
@@ -321,7 +353,7 @@ def render_html(payload: dict, args: argparse.Namespace) -> str:
     references = payload["interactive_data"].get("references", [])
     plot_width = int(args.plot_width)
     plot_height = int(args.plot_height)
-    pad = 34
+    pad = 54
     panel_width = plot_width + pad * 2
     panel_height = plot_height + pad * 2 + 38
     cols = 5 if len(targets) > 12 else 3
@@ -338,11 +370,19 @@ def render_html(payload: dict, args: argparse.Namespace) -> str:
     overlay_text = f"{len(methods)} checkpoints"
     if references:
         overlay_text += f" + {len(references)} references"
+    if args.unified_axis_scale:
+        overlay_text += " | shared axes"
     parts: list[str] = []
     title = (
         f"Top-down trajectory overlays | {Path(payload['dataset']).stem} | "
         f"{overlay_text} | {'all steps' if payload['max_steps'] is None else 'max_steps=' + str(payload['max_steps'])}"
     )
+    loss_weights = payload.get("loss_weights")
+    if loss_weights:
+        title += (
+            f" | loss w: pos={float(loss_weights.get('position', 0.0)):.3g}, "
+            f"rot={float(loss_weights.get('orientation', 0.0)):.3g}"
+        )
 
     parts.append("<!doctype html>")
     parts.append("<html><head><meta charset=\"utf-8\">")
@@ -371,14 +411,18 @@ svg { display: block; background: white; }
 .panel-bg { fill: #ffffff; stroke: #dfe5ee; stroke-width: 1; rx: 6; }
 .plot-bg { fill: #fbfcfe; stroke: #d8dee8; stroke-width: 1; }
 .grid { stroke: #edf1f7; stroke-width: 1; }
+.tick { stroke: #98a2b3; stroke-width: 1; }
+.tick-label { fill: #667085; font-size: 8px; }
 .axis-label, .panel-title { fill: #344054; font-size: 10px; }
 .panel-title { font-size: 11px; font-weight: 600; }
 .target-line { fill: none; stroke: #101828; stroke-width: 2.4; opacity: 0.9; pointer-events: none; }
 .target-marker { fill: #101828; stroke: #101828; pointer-events: none; }
 .track-hit {
   fill: none;
-  stroke: transparent;
-  stroke-width: 13;
+  stroke: rgba(0, 0, 0, 0.001);
+  stroke-width: 15;
+  stroke-linecap: round;
+  stroke-linejoin: round;
   pointer-events: stroke;
   cursor: crosshair;
 }
@@ -407,10 +451,20 @@ svg { display: block; background: white; }
   cursor: default;
   opacity: 0.76;
   transition: opacity 120ms ease;
+  pointer-events: all;
 }
-.legend-item rect { fill: transparent; stroke: transparent; }
+.legend-item rect { fill: rgba(255, 255, 255, 0.001); stroke: transparent; }
 .legend-label { fill: #344054; font-size: 9.5px; dominant-baseline: middle; }
 .legend-swatch { stroke-width: 2.4; }
+.legend-icon { stroke: #ffffff; stroke-width: 1.6; }
+.legend-icon-text {
+  fill: #ffffff;
+  font-size: 8px;
+  font-weight: 700;
+  dominant-baseline: central;
+  text-anchor: middle;
+  pointer-events: none;
+}
 .dimmed .track-line { opacity: 0.08; }
 .dimmed .track-end { opacity: 0.08; }
 .dimmed .legend-item { opacity: 0.26; }
@@ -419,8 +473,10 @@ svg { display: block; background: white; }
 .active-method.legend-item { opacity: 1; }
 .active-method .legend-label { fill: #111827; font-weight: 700; }
 .active-method .legend-box { fill: rgba(37, 99, 235, 0.08); stroke: rgba(37, 99, 235, 0.22); }
+.active-method .legend-icon { stroke: #111827; stroke-width: 2.2; }
 .active-track.track-line { stroke-width: 4.6; }
 .active-track.track-end { r: 4.4; }
+.pinned-method.legend-item .legend-box { fill: rgba(16, 24, 40, 0.06); stroke: rgba(16, 24, 40, 0.28); }
 .tooltip {
   position: fixed;
   z-index: 10;
@@ -470,6 +526,17 @@ svg { display: block; background: white; }
     parts.append(f"<svg id=\"overlaySvg\" width=\"{svg_width}\" height=\"{svg_height}\" viewBox=\"0 0 {svg_width} {svg_height}\">")
     parts.append(f"<text x=\"16\" y=\"24\" class=\"legend-title\">{html_escape(title)}</text>")
 
+    global_axis_bounds = None
+    if args.unified_axis_scale:
+        global_xy = []
+        for target_idx, target in enumerate(targets):
+            global_xy.append(np.asarray(target["xy"], dtype=np.float32))
+            for reference in references:
+                global_xy.append(np.asarray(reference["tracks"][target_idx], dtype=np.float32))
+            for method in methods:
+                global_xy.append(np.asarray(method["tracks"][target_idx], dtype=np.float32))
+        global_axis_bounds = axis_bounds(global_xy, args.axis_padding_frac)
+
     for target_idx, target in enumerate(targets):
         col = target_idx % cols
         row = target_idx // cols
@@ -480,7 +547,10 @@ svg { display: block; background: white; }
             all_xy.append(np.asarray(reference["tracks"][target_idx], dtype=np.float32))
         for method in methods:
             all_xy.append(np.asarray(method["tracks"][target_idx], dtype=np.float32))
-        x_min, x_max, y_min, y_max = axis_bounds(all_xy, args.axis_padding_frac)
+        if global_axis_bounds is None:
+            x_min, x_max, y_min, y_max = axis_bounds(all_xy, args.axis_padding_frac)
+        else:
+            x_min, x_max, y_min, y_max = global_axis_bounds
         scale = min(plot_width / (x_max - x_min), plot_height / (y_max - y_min))
         plot_x = ox + pad
         plot_y = oy + pad
@@ -497,6 +567,30 @@ svg { display: block; background: white; }
             gy = plot_y + grid_idx * plot_height / 4.0
             parts.append(f"<line class=\"grid\" x1=\"{gx:.2f}\" y1=\"{plot_y}\" x2=\"{gx:.2f}\" y2=\"{plot_y + plot_height}\"/>")
             parts.append(f"<line class=\"grid\" x1=\"{plot_x}\" y1=\"{gy:.2f}\" x2=\"{plot_x + plot_width}\" y2=\"{gy:.2f}\"/>")
+        x_span = x_max - x_min
+        y_span = y_max - y_min
+        for tick_value in axis_tick_values(x_min, x_max):
+            tx = plot_x + (tick_value - x_min) * scale
+            label = format_axis_tick(tick_value, x_span)
+            parts.append(
+                f"<line class=\"tick\" x1=\"{tx:.2f}\" y1=\"{plot_y + plot_height:.2f}\" "
+                f"x2=\"{tx:.2f}\" y2=\"{plot_y + plot_height + 4:.2f}\"/>"
+            )
+            parts.append(
+                f"<text class=\"tick-label\" x=\"{tx:.2f}\" y=\"{plot_y + plot_height + 13:.2f}\" "
+                f"text-anchor=\"middle\">{html_escape(label)}</text>"
+            )
+        for tick_value in axis_tick_values(y_min, y_max):
+            ty = plot_y + plot_height - (tick_value - y_min) * scale
+            label = format_axis_tick(tick_value, y_span)
+            parts.append(
+                f"<line class=\"tick\" x1=\"{plot_x - 4:.2f}\" y1=\"{ty:.2f}\" "
+                f"x2=\"{plot_x:.2f}\" y2=\"{ty:.2f}\"/>"
+            )
+            parts.append(
+                f"<text class=\"tick-label\" x=\"{plot_x - 7:.2f}\" y=\"{ty + 3:.2f}\" "
+                f"text-anchor=\"end\">{html_escape(label)}</text>"
+            )
         for reference_idx, reference in enumerate(references):
             reference_id = reference_ids[reference["name"]]
             track_xy = np.asarray(reference["tracks"][target_idx], dtype=np.float32)
@@ -559,7 +653,7 @@ svg { display: block; background: white; }
             f"M {ox + end_x + 4:.2f},{oy + end_y - 4:.2f} "
             f"L {ox + end_x - 4:.2f},{oy + end_y + 4:.2f}\" stroke-width=\"1.8\"/>"
         )
-        parts.append(f"<text class=\"axis-label\" x=\"{plot_x + plot_width - 8}\" y=\"{plot_y + plot_height + 20}\" text-anchor=\"end\">x</text>")
+        parts.append(f"<text class=\"axis-label\" x=\"{plot_x + plot_width - 8}\" y=\"{plot_y + plot_height + 29}\" text-anchor=\"end\">x</text>")
         parts.append(f"<text class=\"axis-label\" x=\"{plot_x - 18}\" y=\"{plot_y + 10}\" text-anchor=\"middle\">y</text>")
         parts.append("</g>")
 
@@ -582,7 +676,11 @@ svg { display: block; background: white; }
             f"<line class=\"legend-swatch\" x1=\"0\" y1=\"0\" x2=\"26\" y2=\"0\" "
             f"stroke=\"{html_escape(reference['color'])}\" stroke-dasharray=\"5 3\"/>"
         )
-        parts.append(f"<text class=\"legend-label\" x=\"34\" y=\"0\">{html_escape(reference['label'])}</text>")
+        parts.append(
+            f"<circle class=\"legend-icon\" cx=\"39\" cy=\"0\" r=\"7\" fill=\"{html_escape(reference['color'])}\"/>"
+        )
+        parts.append(f"<text class=\"legend-icon-text\" x=\"39\" y=\"0\">R</text>")
+        parts.append(f"<text class=\"legend-label\" x=\"52\" y=\"0\">{html_escape(reference['label'])}</text>")
         parts.append("</g>")
     method_legend_start = 44 + len(references) * legend_row_h
     for idx, method in enumerate(methods):
@@ -597,7 +695,9 @@ svg { display: block; background: white; }
         )
         parts.append(f"<rect class=\"legend-box\" x=\"-8\" y=\"-10\" width=\"{args.legend_width - 36}\" height=\"21\" rx=\"4\"/>")
         parts.append(f"<line class=\"legend-swatch\" x1=\"0\" y1=\"0\" x2=\"26\" y2=\"0\" stroke=\"{html_escape(method['color'])}\"/>")
-        parts.append(f"<text class=\"legend-label\" x=\"34\" y=\"0\">{html_escape(label)} | mean loss={avg_loss:.4g}</text>")
+        parts.append(f"<circle class=\"legend-icon\" cx=\"39\" cy=\"0\" r=\"7\" fill=\"{html_escape(method['color'])}\"/>")
+        parts.append(f"<text class=\"legend-icon-text\" x=\"39\" y=\"0\">{idx + 1}</text>")
+        parts.append(f"<text class=\"legend-label\" x=\"52\" y=\"0\">{html_escape(label)} | mean loss={avg_loss:.4g}</text>")
         parts.append("</g>")
     parts.append("</g>")
     parts.append("</svg></div><div id=\"tooltip\" class=\"tooltip\"></div>")
@@ -608,6 +708,8 @@ const svg = document.getElementById('overlaySvg');
 const tooltip = document.getElementById('tooltip');
 let activeMethod = null;
 let activeTrajectory = null;
+let pinnedMethod = null;
+let pinnedTrajectory = null;
 
 function showTooltip(evt, html) {
   if (!html) return;
@@ -632,8 +734,12 @@ function setHighlight(methodId, trajectoryId = null) {
   svg.classList.toggle('dimmed', Boolean(methodId));
   document.querySelectorAll('.active-method').forEach(el => el.classList.remove('active-method'));
   document.querySelectorAll('.active-track').forEach(el => el.classList.remove('active-track'));
+  document.querySelectorAll('.pinned-method').forEach(el => el.classList.remove('pinned-method'));
   if (!methodId) return;
   document.querySelectorAll(`.method-${methodId}`).forEach(el => el.classList.add('active-method'));
+  if (pinnedMethod === methodId) {
+    document.querySelectorAll(`.method-${methodId}`).forEach(el => el.classList.add('pinned-method'));
+  }
   if (trajectoryId !== null) {
     document.querySelectorAll(`.track-line[data-method="${methodId}"][data-traj="${trajectoryId}"]`).forEach(el => {
       el.classList.add('active-track');
@@ -645,29 +751,67 @@ function setHighlight(methodId, trajectoryId = null) {
 }
 
 function clearHighlight() {
-  setHighlight(null, null);
+  if (pinnedMethod) {
+    setHighlight(pinnedMethod, pinnedTrajectory);
+  } else {
+    setHighlight(null, null);
+  }
   hideTooltip();
 }
 
 document.querySelectorAll('.legend-item').forEach(item => {
   item.addEventListener('mouseenter', evt => {
-    setHighlight(item.dataset.method, null);
+    if (!pinnedMethod) setHighlight(item.dataset.method, null);
     showTooltip(evt, item.dataset.tooltip);
   });
   item.addEventListener('mousemove', moveTooltip);
   item.addEventListener('mouseleave', clearHighlight);
+  item.addEventListener('click', evt => {
+    evt.stopPropagation();
+    if (pinnedMethod === item.dataset.method && pinnedTrajectory === null) {
+      pinnedMethod = null;
+      pinnedTrajectory = null;
+      clearHighlight();
+      return;
+    }
+    pinnedMethod = item.dataset.method;
+    pinnedTrajectory = null;
+    setHighlight(pinnedMethod, pinnedTrajectory);
+    showTooltip(evt, item.dataset.tooltip);
+  });
 });
 
 document.querySelectorAll('.track-hit').forEach(path => {
   path.addEventListener('mouseenter', evt => {
-    setHighlight(path.dataset.method, path.dataset.traj);
+    if (!pinnedMethod) setHighlight(path.dataset.method, path.dataset.traj);
     showTooltip(evt, path.dataset.tooltip);
   });
   path.addEventListener('mousemove', moveTooltip);
   path.addEventListener('mouseleave', clearHighlight);
+  path.addEventListener('click', evt => {
+    evt.stopPropagation();
+    pinnedMethod = path.dataset.method;
+    pinnedTrajectory = path.dataset.traj;
+    setHighlight(pinnedMethod, pinnedTrajectory);
+    showTooltip(evt, path.dataset.tooltip);
+  });
 });
 
-document.getElementById('resetBtn').addEventListener('click', clearHighlight);
+function resetPinnedHighlight() {
+  pinnedMethod = null;
+  pinnedTrajectory = null;
+  setHighlight(null, null);
+  hideTooltip();
+}
+
+document.getElementById('resetBtn').addEventListener('click', evt => {
+  evt.stopPropagation();
+  resetPinnedHighlight();
+});
+document.addEventListener('click', resetPinnedHighlight);
+document.addEventListener('keydown', evt => {
+  if (evt.key === 'Escape') resetPinnedHighlight();
+});
 </script>
 """
     )
@@ -692,6 +836,7 @@ def main() -> None:
     summary_output.parent.mkdir(parents=True, exist_ok=True)
     summary_payload = dict(payload)
     summary_payload["output"] = str(args.output)
+    summary_payload["unified_axis_scale"] = bool(args.unified_axis_scale)
     summary_output.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
     print(f"wrote {args.output}")
     print(f"wrote {summary_output}")
