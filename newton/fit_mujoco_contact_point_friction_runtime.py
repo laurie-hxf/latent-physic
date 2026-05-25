@@ -236,9 +236,6 @@ def forward_rollout_with_batched_trajectory_loss(
 ) -> wp.array:
     point_count = len(diff_scene.local_surface_points_np)
     point_scale = resolve_point_position_loss_scale(args, point_count)
-    accumulate_velocity_loss = int(
-        args.linear_velocity_loss_weight > 0.0 or args.angular_velocity_loss_weight > 0.0
-    )
 
     wp.launch(
         scatter_active_point_friction_kernel,
@@ -293,7 +290,6 @@ def forward_rollout_with_batched_trajectory_loss(
             buffers.orientation_loss,
             buffers.linear_velocity_loss,
             buffers.angular_velocity_loss,
-            accumulate_velocity_loss,
         ],
         device=diff_scene.model.device,
     )
@@ -377,7 +373,6 @@ def forward_rollout_with_batched_trajectory_loss(
                 buffers.orientation_loss,
                 buffers.linear_velocity_loss,
                 buffers.angular_velocity_loss,
-                accumulate_velocity_loss,
             ],
             device=diff_scene.model.device,
         )

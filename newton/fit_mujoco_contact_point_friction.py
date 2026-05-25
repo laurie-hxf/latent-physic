@@ -638,7 +638,6 @@ def accumulate_batched_frame_loss_kernel(
     orientation_loss: wp.array(dtype=float),
     linear_velocity_loss: wp.array(dtype=float),
     angular_velocity_loss: wp.array(dtype=float),
-    accumulate_velocity_loss: int,
 ):
     tid = wp.tid()
     batch_idx = tid // point_count
@@ -676,18 +675,17 @@ def accumulate_batched_frame_loss_kernel(
 
     wp.atomic_add(orientation_loss, batch_idx, frame_scale * orientation_loss_value)
 
-    if accumulate_velocity_loss != 0:
-        spatial_velocity = body_qd[body_id]
-        linear_velocity = wp.spatial_top(spatial_velocity)
-        angular_velocity = wp.spatial_bottom(spatial_velocity)
+    spatial_velocity = body_qd[body_id]
+    linear_velocity = wp.spatial_top(spatial_velocity)
+    angular_velocity = wp.spatial_bottom(spatial_velocity)
 
-        linear_delta = linear_velocity - target_linear_velocity[target_offset]
-        angular_delta = angular_velocity - target_angular_velocity[target_offset]
-        linear_loss_value = wp.dot(linear_delta, linear_delta)
-        angular_loss_value = wp.dot(angular_delta, angular_delta)
+    linear_delta = linear_velocity - target_linear_velocity[target_offset]
+    angular_delta = angular_velocity - target_angular_velocity[target_offset]
+    linear_loss_value = wp.dot(linear_delta, linear_delta)
+    angular_loss_value = wp.dot(angular_delta, angular_delta)
 
-        wp.atomic_add(linear_velocity_loss, batch_idx, frame_scale * linear_loss_value)
-        wp.atomic_add(angular_velocity_loss, batch_idx, frame_scale * angular_loss_value)
+    wp.atomic_add(linear_velocity_loss, batch_idx, frame_scale * linear_loss_value)
+    wp.atomic_add(angular_velocity_loss, batch_idx, frame_scale * angular_loss_value)
 
 
 @wp.kernel

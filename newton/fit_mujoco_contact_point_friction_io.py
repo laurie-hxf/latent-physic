@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -12,6 +14,40 @@ DEFAULT_TRAJECTORY_NPZ_PATH = REPO_ROOT / "mujoco" / "outputs" / "block_force_da
 DEFAULT_CONTACT_FRICTION_EXPERIMENT_DIR = DEFAULT_OUTPUT_DIR / "mujoco_contact_point_friction_fit"
 DEFAULT_TRAIN_BATCH_SIZE = 64
 DEFAULT_TRAJECTORY_PROGRESS_EVERY = 256
+EXPERIMENT_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+TIMESTAMPED_EXPERIMENT_NAME_RE = re.compile(r"^\d{8}_\d{6}_.+")
+
+
+def _current_experiment_timestamp() -> str:
+    return datetime.now().astimezone().strftime(EXPERIMENT_TIMESTAMP_FORMAT)
+
+
+def _apply_experiment_dir_timestamp(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    args.experiment_timestamp = None
+    args.requested_experiment_dir = args.experiment_dir
+    if not args.timestamp_experiment_dir:
+        return
+
+    experiment_dir = args.experiment_dir
+    experiment_name = experiment_dir.name
+    if not experiment_name:
+        parser.error("--experiment-dir must include a directory name.")
+
+    if TIMESTAMPED_EXPERIMENT_NAME_RE.match(experiment_name):
+        args.experiment_timestamp = experiment_name[:15]
+        return
+
+    timestamp = args.experiment_dir_timestamp or _current_experiment_timestamp()
+    if not timestamp or "/" in timestamp or "\\" in timestamp:
+        parser.error("--experiment-dir-timestamp must be a non-empty path-safe string.")
+
+    args.experiment_timestamp = timestamp
+    args.experiment_dir = experiment_dir.with_name(f"{timestamp}_{experiment_name}")
+    if (
+        args.wandb_run_name is not None
+        and not TIMESTAMPED_EXPERIMENT_NAME_RE.match(args.wandb_run_name)
+    ):
+        args.wandb_run_name = f"{timestamp}_{args.wandb_run_name}"
 
 
 def _resolve_point_cloud_color_range(
@@ -149,6 +185,25 @@ def parse_args() -> argparse.Namespace:
             "<name>_results.npz final result archive, and <name>.usda scene export."
         ),
     )
+    parser.add_argument(
+        "--timestamp-experiment-dir",
+        dest="timestamp_experiment_dir",
+        action="store_true",
+        default=True,
+        help="Prefix --experiment-dir's final directory name with the current local timestamp.",
+    )
+    parser.add_argument(
+        "--no-timestamp-experiment-dir",
+        dest="timestamp_experiment_dir",
+        action="store_false",
+        help="Keep --experiment-dir exactly as supplied.",
+    )
+    parser.add_argument(
+        "--experiment-dir-timestamp",
+        type=str,
+        default=None,
+        help="Override the timestamp prefix used when --timestamp-experiment-dir is enabled.",
+    )
     parser.add_argument("--max-trajectories", type=int, default=None, help="Use only the first N trajectories when the input NPZ is a dataset.")
     parser.add_argument(
         "--batch-size",
@@ -281,5 +336,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-steps", type=int, default=0)
     parser.add_argument("--loss-target-position", type=float, nargs=3, default=None)
     args = parser.parse_args()
+    _apply_experiment_dir_timestamp(args, parser)
     _attach_experiment_output_paths(args, parser)
     return args
