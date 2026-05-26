@@ -518,6 +518,14 @@ def checkpoint_legend_label(method: MethodSpec, checkpoint: CheckpointParams) ->
             f"{prefix} | left-right {iteration} "
             f"L={float(checkpoint.optimizer_params[0]):.3f} R={float(checkpoint.optimizer_params[1]):.3f}"
         )
+    if checkpoint.parameterization == "base-delta" and len(checkpoint.optimizer_params) >= 3:
+        mu_base = float(checkpoint.optimizer_params[0])
+        delta_left = float(checkpoint.optimizer_params[1])
+        delta_right = float(checkpoint.optimizer_params[2])
+        return (
+            f"{prefix} | base-delta {iteration} "
+            f"base={mu_base:.3f} L={mu_base + delta_left:.3f} R={mu_base + delta_right:.3f}"
+        )
     return (
         f"{prefix} | {checkpoint.parameterization} {iteration} "
         f"mu={float(np.mean(params)):.3f}+/-{float(np.std(params)):.3f} "
@@ -550,6 +558,13 @@ def checkpoint_summary(method: MethodSpec, checkpoint: CheckpointParams, losses:
     if checkpoint.parameterization == "left-right" and len(checkpoint.optimizer_params) >= 2:
         summary["mu_left_param"] = float(checkpoint.optimizer_params[0])
         summary["mu_right_param"] = float(checkpoint.optimizer_params[1])
+    if checkpoint.parameterization == "base-delta" and len(checkpoint.optimizer_params) >= 3:
+        summary["mu_base_param"] = float(checkpoint.optimizer_params[0])
+        summary["delta_left_param"] = float(checkpoint.optimizer_params[1])
+        summary["delta_right_param"] = float(checkpoint.optimizer_params[2])
+        summary["delta_sum"] = float(checkpoint.optimizer_params[1] + checkpoint.optimizer_params[2])
+        summary["mu_left_param"] = float(checkpoint.optimizer_params[0] + checkpoint.optimizer_params[1])
+        summary["mu_right_param"] = float(checkpoint.optimizer_params[0] + checkpoint.optimizer_params[2])
     return summary
 
 

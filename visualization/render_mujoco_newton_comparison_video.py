@@ -412,6 +412,12 @@ def summarize_friction_parameters(
     if parameterization == "left-right" and optimizer_params is not None and len(optimizer_params) >= 2:
         return f"left-right muL={float(optimizer_params[0]):.3f} muR={float(optimizer_params[1]):.3f}"
 
+    if parameterization == "base-delta" and optimizer_params is not None and len(optimizer_params) >= 3:
+        mu_base = float(optimizer_params[0])
+        delta_left = float(optimizer_params[1])
+        delta_right = float(optimizer_params[2])
+        return f"base-delta base={mu_base:.3f} muL={mu_base + delta_left:.3f} muR={mu_base + delta_right:.3f}"
+
     side_ids = np.full(len(active_params), -1, dtype=np.int32)
     if len(active_indices) > 0:
         local_x = np.asarray(local_surface_points, dtype=np.float32)[active_indices, 0]

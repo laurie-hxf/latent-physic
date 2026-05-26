@@ -136,6 +136,72 @@ def _truncate_trajectory(
     )
 
 
+def slice_mujoco_trajectory_time_window(
+    trajectory: MujocoTrajectory,
+    *,
+    start_step: int,
+    window_steps: int,
+) -> MujocoTrajectory:
+    total_steps = trajectory.num_steps
+    if total_steps < 1:
+        raise ValueError("trajectory does not contain enough frames")
+
+    start = int(start_step)
+    if start < 0 or start >= total_steps:
+        raise ValueError(f"start_step must be in [0, {total_steps - 1}], got {start_step}")
+
+    requested_steps = max(int(window_steps), 1)
+    used_steps = min(requested_steps, total_steps - start)
+    if used_steps < 1:
+        raise ValueError(
+            f"Could not slice a non-empty trajectory window from start_step={start_step}, "
+            f"window_steps={window_steps}, total_steps={total_steps}"
+        )
+
+    end_frame = start + used_steps + 1
+    end_step = start + used_steps
+    metadata = dict(trajectory.metadata)
+    metadata.update(
+        {
+            "source_num_steps": int(total_steps),
+            "window_start_step": int(start),
+            "window_steps": int(used_steps),
+            "window_start_time": float(trajectory.time[start]),
+        }
+    )
+    return MujocoTrajectory(
+        time=np.asarray(trajectory.time[start:end_frame], dtype=np.float32),
+        positions=np.asarray(trajectory.positions[start:end_frame], dtype=np.float32),
+        quaternions_xyzw=np.asarray(trajectory.quaternions_xyzw[start:end_frame], dtype=np.float32),
+        linear_velocity=np.asarray(trajectory.linear_velocity[start:end_frame], dtype=np.float32),
+        angular_velocity=np.asarray(trajectory.angular_velocity[start:end_frame], dtype=np.float32),
+        step_forces=np.asarray(trajectory.step_forces[start:end_step], dtype=np.float32),
+        force_point_offset_local=np.asarray(trajectory.force_point_offset_local, dtype=np.float32).reshape(3),
+        timestep=float(trajectory.timestep),
+        metadata=metadata,
+    )
+
+
+def sample_mujoco_trajectory_time_window(
+    trajectory: MujocoTrajectory,
+    *,
+    window_steps: int,
+    rng: np.random.Generator,
+) -> tuple[MujocoTrajectory, int]:
+    total_steps = trajectory.num_steps
+    requested_steps = max(int(window_steps), 1)
+    max_start = max(total_steps - requested_steps, 0)
+    start_step = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
+    return (
+        slice_mujoco_trajectory_time_window(
+            trajectory,
+            start_step=start_step,
+            window_steps=requested_steps,
+        ),
+        start_step,
+    )
+
+
 def load_mujoco_trajectory_dataset(
     dataset_npz_path: Path,
     max_steps: int | None,

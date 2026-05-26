@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from pbd_io import build_ee_action_sequence, parse_args, resolve_step_output_dir
 from pbd_scene import (
     advance_prescribed_cluster,

@@ -324,6 +324,13 @@ def main() -> None:
         if ckpt["parameterization"] == "left-right":
             result["mu_left_param"] = float(ckpt["optimizer_params"][0])
             result["mu_right_param"] = float(ckpt["optimizer_params"][1])
+        if ckpt["parameterization"] == "base-delta" and len(ckpt["optimizer_params"]) >= 3:
+            result["mu_base_param"] = float(ckpt["optimizer_params"][0])
+            result["delta_left_param"] = float(ckpt["optimizer_params"][1])
+            result["delta_right_param"] = float(ckpt["optimizer_params"][2])
+            result["delta_sum"] = float(ckpt["optimizer_params"][1] + ckpt["optimizer_params"][2])
+            result["mu_left_param"] = float(ckpt["optimizer_params"][0] + ckpt["optimizer_params"][1])
+            result["mu_right_param"] = float(ckpt["optimizer_params"][0] + ckpt["optimizer_params"][2])
         results.append(result)
 
     OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)

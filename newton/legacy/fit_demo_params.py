@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import re
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from project_paths import DEFAULT_DEMO_PATH, DEFAULT_PLY_PATH
 from pbd_math import normalize_quaternion, quaternion_conjugate, quaternion_multiply

@@ -164,6 +164,7 @@ def load_checkpoint(checkpoint_path: Path, param_set: str) -> dict[str, object]:
             "active_params": active_params,
             "optimizer_params": optimizer_params,
             "parameterization": str(scalar(data, "friction_parameterization", "point")),
+            "left_right_delta_sum_zero": bool(scalar(data, "left_right_delta_sum_zero", False)),
             "iteration": int(scalar(data, "iteration", -1)),
             "best_loss": float(scalar(data, "best_loss", float("nan"))),
             "train_trajectory_npz": str(scalar(data, "trajectory_npz_path", "")),
@@ -415,6 +416,14 @@ def main() -> None:
     if str(checkpoint["parameterization"]) == "left-right" and len(optimizer_params) >= 2:
         metrics["mu_left_param"] = float(optimizer_params[0])
         metrics["mu_right_param"] = float(optimizer_params[1])
+    if str(checkpoint["parameterization"]) == "base-delta" and len(optimizer_params) >= 3:
+        metrics["mu_base_param"] = float(optimizer_params[0])
+        metrics["delta_left_param"] = float(optimizer_params[1])
+        metrics["delta_right_param"] = float(optimizer_params[2])
+        metrics["delta_sum"] = float(optimizer_params[1] + optimizer_params[2])
+        metrics["mu_left_param"] = float(optimizer_params[0] + optimizer_params[1])
+        metrics["mu_right_param"] = float(optimizer_params[0] + optimizer_params[2])
+        metrics["left_right_delta_sum_zero"] = bool(checkpoint["left_right_delta_sum_zero"])
 
     summary_json_path = paths["eval_dir"] / "eval_summary.json"
     summary_npz_path = paths["eval_dir"] / "eval_summary.npz"

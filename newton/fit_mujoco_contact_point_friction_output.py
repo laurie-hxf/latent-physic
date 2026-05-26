@@ -61,6 +61,19 @@ def export_contact_friction_outputs(
         learned_point_friction=learned_point_friction,
         learned_active_point_friction=best_active_params,
         friction_parameterization=np.asarray(str(getattr(args, "friction_parameterization", "point"))),
+        left_right_delta_sum_zero=np.asarray(bool(getattr(args, "left_right_delta_sum_zero", False))),
+        random_time_windows=np.asarray(bool(getattr(args, "random_time_windows", False))),
+        window_steps=np.asarray(
+            -1 if getattr(args, "window_steps", None) is None else int(args.window_steps),
+            dtype=np.int32,
+        ),
+        time_window_source_max_steps=np.asarray(
+            -1
+            if getattr(args, "time_window_source_max_steps", None) is None
+            else int(args.time_window_source_max_steps),
+            dtype=np.int32,
+        ),
+        training_rollout_steps=np.asarray(int(getattr(args, "steps", 0)), dtype=np.int32),
         learned_optimizer_friction=np.asarray(best_optimizer_params, dtype=np.float32),
         loss_history=np.asarray(loss_history, dtype=np.float32),
         best_loss=np.asarray(best_loss, dtype=np.float32),

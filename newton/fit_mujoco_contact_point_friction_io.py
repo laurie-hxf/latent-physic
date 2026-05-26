@@ -265,6 +265,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-skip-replay", action="store_true")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-steps", type=int, default=None, help="Use only the first N simulation steps from the MuJoCo trajectory.")
+    parser.add_argument(
+        "--random-time-windows",
+        action="store_true",
+        help=(
+            "During training, sample a random contiguous time window from each selected trajectory. "
+            "The Newton initial state is set from the MuJoCo state at the sampled window start."
+        ),
+    )
+    parser.add_argument(
+        "--window-steps",
+        type=int,
+        default=None,
+        help=(
+            "Number of steps per random training window. Defaults to --max-steps when "
+            "--random-time-windows is enabled; if both are unset, uses the full loaded trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--time-window-source-max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Optional source-trajectory truncation before random time-window sampling. "
+            "Defaults to loading full trajectories so windows can start beyond --max-steps."
+        ),
+    )
     parser.add_argument("--opt-iters", type=int, default=60)
     parser.add_argument("--learning-rate", type=float, default=2.0e-2)
     parser.add_argument(
@@ -280,12 +306,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-point-friction", type=float, default=2.0)
     parser.add_argument(
         "--friction-parameterization",
-        choices=("point", "left-right", "global"),
+        choices=("point", "left-right", "global", "base-delta"),
         default="point",
         help=(
             "Friction parameters to optimize. 'point' keeps one parameter per active surface point; "
             "'left-right' optimizes only two x-split parameters and broadcasts them to all active points; "
-            "'global' optimizes one parameter shared by all active points."
+            "'global' optimizes one parameter shared by all active points; "
+            "'base-delta' optimizes [mu_base, delta_left, delta_right] and uses mu_base + delta_side."
+        ),
+    )
+    parser.add_argument(
+        "--left-right-delta-sum-zero",
+        action="store_true",
+        help=(
+            "For --friction-parameterization base-delta, constrain delta_left + delta_right to zero "
+            "by projecting gradients and parameters onto the constraint."
         ),
     )
     parser.add_argument("--position-loss-weight", type=float, default=1.0)
