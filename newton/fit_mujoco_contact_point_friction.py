@@ -62,6 +62,7 @@ from fit_mujoco_contact_point_friction_runtime import (
     sample_training_batch_indices,
     should_log_trajectory_progress,
 )
+from dino_mlp_warp_friction import build_warp_dino_mlp_friction_model
 from newton_surface_points_diff_demo import build_diff_scene
 
 
@@ -81,6 +82,8 @@ def main() -> None:
     piecewise_regularization_weight = float(args.piecewise_regularization_weight)
     if piecewise_regularization_weight < 0.0:
         raise ValueError("--piecewise-regularization-weight must be non-negative.")
+    if parameterization == "dino-mlp" and args.dino_feature_npz is None:
+        raise ValueError("--dino-feature-npz is required with --friction-parameterization dino-mlp.")
 
     startup_time = time.time()
     trajectory_load_max_steps = resolve_trajectory_load_max_steps(args)
@@ -140,13 +143,48 @@ def main() -> None:
         f"| startup_elapsed={time.time() - startup_time:.2f}s"
     )
     active_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
-    active_param_positions, optimizer_param_count = build_optimizer_param_positions(
-        parameterization=parameterization,
-        active_side_ids=active_side_ids,
-        active_count=len(active_indices),
-    )
+    if parameterization == "dino-mlp":
+        active_param_positions = np.arange(len(active_indices), dtype=np.int32)
+        optimizer_param_count = 0
+    else:
+        active_param_positions, optimizer_param_count = build_optimizer_param_positions(
+            parameterization=parameterization,
+            active_side_ids=active_side_ids,
+            active_count=len(active_indices),
+        )
     active_param_lookup = np.full(len(diff_scene.local_surface_points_np), -1, dtype=np.int32)
     active_param_lookup[active_indices] = active_param_positions
+    device = str(diff_scene.torch_device)
+    dino_mlp_model = None
+    dino_mlp_metadata: dict[str, np.ndarray] = {}
+    if parameterization == "dino-mlp":
+        dino_mlp_model, dino_mlp_metadata = build_warp_dino_mlp_friction_model(
+            dino_npz_path=args.dino_feature_npz,
+            local_surface_points=diff_scene.local_surface_points_np,
+            half_extents=np.asarray(args.box_half_extents, dtype=np.float32),
+            active_capacity=len(active_indices),
+            hidden_dim=int(args.dino_mlp_hidden_dim),
+            hidden_layers=int(args.dino_mlp_hidden_layers),
+            initial_mu=float(args.point_friction),
+            min_mu=float(args.min_point_friction),
+            max_mu=float(args.max_point_friction),
+            seed=int(args.seed),
+            device=device,
+            position_frequencies=int(args.dino_position_frequencies),
+            neighbor_radius=float(args.dino_neighbor_radius),
+            neighbor_k=int(args.dino_neighbor_k),
+            normalize_dino=bool(args.dino_feature_normalization),
+            max_match_distance=float(args.dino_mlp_max_match_distance),
+        )
+        optimizer_param_count = dino_mlp_model.param_count
+        log_message(
+            f"dino_mlp input_dim={int(dino_mlp_metadata['input_dim'])} "
+            f"encoded_position_dim={int(dino_mlp_metadata['encoded_position_dim'])} "
+            f"neighbor_dino_dim={int(dino_mlp_metadata['neighbor_dino_dim'])} "
+            f"hidden_layers={int(args.dino_mlp_hidden_layers)} "
+            f"hidden_dim={int(args.dino_mlp_hidden_dim)} "
+            f"params={optimizer_param_count}"
+        )
     log_message(
         f"friction_parameterization={parameterization} optimizer_parameters={optimizer_param_count} "
         f"left_right_delta_sum_zero={int(left_right_delta_sum_zero)}"
@@ -163,26 +201,32 @@ def main() -> None:
             f"run={wandb_run.name} | mode={args.wandb_mode}"
         )
 
-    optimizer_params_np = initialize_optimizer_params_np(
-        parameterization=parameterization,
-        optimizer_param_count=optimizer_param_count,
-        point_friction=float(args.point_friction),
-    )
-    if parameterization == "base-delta":
-        optimizer_params_np = project_base_delta_optimizer_params_np(
-            optimizer_params_np,
-            min_value=float(args.min_point_friction),
-            max_value=float(args.max_point_friction),
-            left_right_delta_sum_zero=left_right_delta_sum_zero,
+    if parameterization == "dino-mlp":
+        assert dino_mlp_model is not None
+        optimizer_params_np = dino_mlp_model.params_numpy()
+        active_params_np = dino_mlp_model.predict_np(active_indices)
+        adam_m_np, adam_v_np, adam_step_np = dino_mlp_model.moments_numpy()
+    else:
+        optimizer_params_np = initialize_optimizer_params_np(
+            parameterization=parameterization,
+            optimizer_param_count=optimizer_param_count,
+            point_friction=float(args.point_friction),
         )
-    active_params_np = expand_optimizer_params_to_active(
-        optimizer_params_np,
-        active_param_positions,
-        parameterization=parameterization,
-    )
-    adam_m_np = np.zeros(optimizer_param_count, dtype=np.float64)
-    adam_v_np = np.zeros(optimizer_param_count, dtype=np.float64)
-    adam_step_np = np.zeros(optimizer_param_count, dtype=np.int32)
+        if parameterization == "base-delta":
+            optimizer_params_np = project_base_delta_optimizer_params_np(
+                optimizer_params_np,
+                min_value=float(args.min_point_friction),
+                max_value=float(args.max_point_friction),
+                left_right_delta_sum_zero=left_right_delta_sum_zero,
+            )
+        active_params_np = expand_optimizer_params_to_active(
+            optimizer_params_np,
+            active_param_positions,
+            parameterization=parameterization,
+        )
+        adam_m_np = np.zeros(optimizer_param_count, dtype=np.float64)
+        adam_v_np = np.zeros(optimizer_param_count, dtype=np.float64)
+        adam_step_np = np.zeros(optimizer_param_count, dtype=np.int32)
     loss_history: list[float] = []
     best_loss = float("inf")
     best_optimizer_params = optimizer_params_np.copy()
@@ -223,28 +267,41 @@ def main() -> None:
                 max_value=float(args.max_point_friction),
                 left_right_delta_sum_zero=left_right_delta_sum_zero,
             )
-        active_params_np = expand_optimizer_params_to_active(
-            optimizer_params_np,
-            active_param_positions,
-            parameterization=parameterization,
-        )
-        best_active_params = expand_optimizer_params_to_active(
-            best_optimizer_params,
-            active_param_positions,
-            parameterization=parameterization,
-        )
+        if parameterization == "dino-mlp":
+            assert dino_mlp_model is not None
+            dino_mlp_model.assign_params(optimizer_params_np)
+            dino_mlp_model.assign_moments(adam_m_np, adam_v_np, adam_step_np)
+            active_params_np = dino_mlp_model.predict_np(active_indices)
+            best_active_params = dino_mlp_model.predict_np(active_indices, params=best_optimizer_params)
+        else:
+            active_params_np = expand_optimizer_params_to_active(
+                optimizer_params_np,
+                active_param_positions,
+                parameterization=parameterization,
+            )
+            best_active_params = expand_optimizer_params_to_active(
+                best_optimizer_params,
+                active_param_positions,
+                parameterization=parameterization,
+            )
         start_iteration = resume_iteration + 1
         log_message(
             f"resumed checkpoint {args.resume_checkpoint.resolve()} "
             f"at iteration={resume_iteration} best_loss={best_loss:.6f}"
         )
-    device = str(diff_scene.torch_device)
     active_indices_wp = wp.array(active_indices, dtype=wp.int32, device=device)
     active_param_positions_wp = wp.array(active_param_positions, dtype=wp.int32, device=device)
-    optimizer_params = wp.array(optimizer_params_np, dtype=wp.float32, device=device)
-    adam_m = wp.array(adam_m_np, dtype=wp.float64, device=device)
-    adam_v = wp.array(adam_v_np, dtype=wp.float64, device=device)
-    adam_step = wp.array(adam_step_np, dtype=wp.int32, device=device)
+    if parameterization == "dino-mlp":
+        assert dino_mlp_model is not None
+        optimizer_params = dino_mlp_model.params
+        adam_m = dino_mlp_model.first_moment
+        adam_v = dino_mlp_model.second_moment
+        adam_step = dino_mlp_model.adam_step
+    else:
+        optimizer_params = wp.array(optimizer_params_np, dtype=wp.float32, device=device)
+        adam_m = wp.array(adam_m_np, dtype=wp.float64, device=device)
+        adam_v = wp.array(adam_v_np, dtype=wp.float64, device=device)
+        adam_step = wp.array(adam_step_np, dtype=wp.int32, device=device)
     beta1_power = wp.array(
         np.power(float(args.adam_beta1), adam_step_np.astype(np.float64)),
         dtype=wp.float64,
@@ -260,22 +317,30 @@ def main() -> None:
     def sync_best_active_params(*, context: str) -> None:
         nonlocal best_optimizer_params, best_active_params
         best_optimizer_params = best_optimizer_params_device.numpy().astype(np.float32)
-        best_active_params = expand_optimizer_params_to_active(
-            best_optimizer_params,
-            active_param_positions,
-            parameterization=parameterization,
-        )
+        if parameterization == "dino-mlp":
+            assert dino_mlp_model is not None
+            best_active_params = dino_mlp_model.predict_np(active_indices, params=best_optimizer_params)
+        else:
+            best_active_params = expand_optimizer_params_to_active(
+                best_optimizer_params,
+                active_param_positions,
+                parameterization=parameterization,
+            )
         assert_array_finite("best_optimizer_params", best_optimizer_params, context=context)
         assert_array_finite("best_active_params", best_active_params, context=context)
 
     def sync_optimizer_state(*, context: str) -> None:
         nonlocal optimizer_params_np, active_params_np, adam_m_np, adam_v_np, adam_step_np
         optimizer_params_np = optimizer_params.numpy().astype(np.float32)
-        active_params_np = expand_optimizer_params_to_active(
-            optimizer_params_np,
-            active_param_positions,
-            parameterization=parameterization,
-        )
+        if parameterization == "dino-mlp":
+            assert dino_mlp_model is not None
+            active_params_np = dino_mlp_model.predict_np(active_indices)
+        else:
+            active_params_np = expand_optimizer_params_to_active(
+                optimizer_params_np,
+                active_param_positions,
+                parameterization=parameterization,
+            )
         adam_m_np = adam_m.numpy()
         adam_v_np = adam_v.numpy()
         adam_step_np = adam_step.numpy()
@@ -358,7 +423,14 @@ def main() -> None:
             )
             buffers = build_batched_optimization_buffers(diff_scene, batch_trajectories, args, batch_active_indices)
             buffers.full_point_friction.assign(buffers.inactive_point_friction_np)
-            if parameterization == "base-delta":
+            if parameterization == "dino-mlp":
+                assert dino_mlp_model is not None
+                full_point_friction_np = buffers.inactive_point_friction_np.copy()
+                full_point_friction_np[active_indices] = dino_mlp_model.predict_np(active_indices)
+                buffers.full_point_friction.assign(full_point_friction_np)
+                batch_active_params = dino_mlp_model.predict_np(batch_active_indices)
+                buffers.active_point_friction.assign(batch_active_params)
+            elif parameterization == "base-delta":
                 full_point_friction_np = buffers.inactive_point_friction_np.copy()
                 full_point_friction_np[active_indices] = active_params_np
                 buffers.full_point_friction.assign(full_point_friction_np)
@@ -404,9 +476,19 @@ def main() -> None:
                 piecewise_side_means_wp = wp.array(piecewise_side_means, dtype=wp.float32, device=device)
                 piecewise_side_inv_counts_wp = wp.array(piecewise_side_inv_counts, dtype=wp.float32, device=device)
             clear_batched_optimization_grads(buffers)
+            if parameterization == "dino-mlp":
+                assert dino_mlp_model is not None
+                dino_mlp_model.zero_grad()
 
             tape = wp.Tape()
             with tape:
+                if parameterization == "dino-mlp":
+                    assert dino_mlp_model is not None
+                    dino_mlp_model.forward_active(
+                        buffers.active_indices,
+                        len(batch_active_indices),
+                        buffers.active_point_friction,
+                    )
                 reset_scene_states(diff_scene, initial_body_q, initial_body_qd)
                 forward_rollout_with_batched_trajectory_loss(
                     diff_scene,
@@ -508,7 +590,30 @@ def main() -> None:
             orientation_loss_value = float(args.orientation_loss_weight) * raw_orientation_loss_value
             linear_velocity_loss_value = float(args.linear_velocity_loss_weight) * raw_linear_velocity_loss_value
             angular_velocity_loss_value = float(args.angular_velocity_loss_weight) * raw_angular_velocity_loss_value
-            if parameterization != "point":
+            if parameterization == "dino-mlp":
+                assert dino_mlp_model is not None
+                optimizer_grad_np = None
+                optimizer_touched_mask = None
+                raw_grad_norm, grad_abs_mean_value, grad_abs_max_value, dino_param_nonfinite_count = (
+                    dino_mlp_model.grad_stats()
+                )
+                if dino_param_nonfinite_count != 0:
+                    tape.zero()
+                    checkpoint_saved = should_save_iteration_checkpoint(args, iteration)
+                    if checkpoint_saved:
+                        save_iteration_checkpoint(iteration)
+                    log_message(
+                        f"iter={iteration:04d} skipped=nonfinite_dino_mlp_param_grad "
+                        f"nonfinite_param_grad_count={dino_param_nonfinite_count} "
+                        f"checkpoint_saved={int(checkpoint_saved)} "
+                        f"batch_active_points={len(batch_active_indices)}/{len(active_indices)} "
+                        f"batch={len(batch_trajectories)}/{len(batch_trajectories)} "
+                        f"window_start_min={batch_window_start_min} "
+                        f"window_start_max={batch_window_start_max} "
+                        f"elapsed={time.time() - iteration_start:.2f}s"
+                    )
+                    continue
+            elif parameterization != "point":
                 optimizer_grad_np, optimizer_touched_mask = aggregate_optimizer_gradients_np(
                     point_grads=buffers.active_point_friction.grad.numpy(),
                     active_param_positions=batch_active_param_positions,
@@ -548,7 +653,31 @@ def main() -> None:
             grad_clip_ratio_value = grad_clip_clipped_count / max(grad_clip_total_count, 1)
             beta1 = float(args.adam_beta1)
             beta2 = float(args.adam_beta2)
-            if parameterization != "point":
+            if parameterization == "dino-mlp":
+                assert dino_mlp_model is not None
+                dino_mlp_model.adam_step_update(
+                    grad_scale=grad_clip_scale,
+                    learning_rate=float(args.learning_rate),
+                    beta1=beta1,
+                    beta2=beta2,
+                    eps=float(args.adam_eps),
+                )
+                optimizer_params_np = dino_mlp_model.params_numpy()
+                adam_m_np, adam_v_np, adam_step_np = dino_mlp_model.moments_numpy()
+                param_nonfinite_count = int(np.count_nonzero(~np.isfinite(optimizer_params_np)))
+                adam_m_nonfinite_count = int(np.count_nonzero(~np.isfinite(adam_m_np)))
+                adam_v_nonfinite_count = int(np.count_nonzero(~np.isfinite(adam_v_np)))
+                if param_nonfinite_count != 0 or adam_m_nonfinite_count != 0 or adam_v_nonfinite_count != 0:
+                    tape.zero()
+                    raise FloatingPointError(
+                        f"iter={iteration:04d} after DINO-MLP Adam update: "
+                        f"optimizer_params_nonfinite_count={param_nonfinite_count} "
+                        f"adam_m_nonfinite_count={adam_m_nonfinite_count} "
+                        f"adam_v_nonfinite_count={adam_v_nonfinite_count}"
+                    )
+                active_params_np = dino_mlp_model.predict_np(active_indices)
+                mu_mean_value, mu_std_value, mu_min_value, mu_max_value = compute_parameter_stats_np(active_params_np)
+            elif parameterization != "point":
                 assert optimizer_grad_np is not None
                 assert optimizer_touched_mask is not None
                 adam_update_np(
@@ -767,6 +896,29 @@ def main() -> None:
             best_active_params,
             context="final export",
         )
+        learned_point_friction_override = None
+        extra_result_arrays: dict[str, np.ndarray] = {}
+        if parameterization == "dino-mlp":
+            assert dino_mlp_model is not None
+            all_surface_indices = np.arange(len(diff_scene.local_surface_points_np), dtype=np.int32)
+            dino_mlp_all_point_friction = dino_mlp_model.predict_np(
+                all_surface_indices,
+                params=best_optimizer_params,
+            )
+            assert_array_finite(
+                "dino_mlp_all_point_friction",
+                dino_mlp_all_point_friction,
+                context="final export",
+            )
+            learned_point_friction_override = dino_mlp_all_point_friction
+            extra_result_arrays = {
+                "dino_feature_npz_path": np.asarray(str(args.dino_feature_npz)),
+                "dino_feature_normalization": np.asarray(bool(args.dino_feature_normalization)),
+                "dino_mlp_all_point_friction": dino_mlp_all_point_friction,
+                "dino_mlp_max_match_distance": np.asarray(float(args.dino_mlp_max_match_distance), dtype=np.float32),
+            }
+            for key, value in dino_mlp_metadata.items():
+                extra_result_arrays[f"dino_mlp_{key}"] = np.asarray(value)
         export_contact_friction_outputs(
             args=args,
             trajectory_collection=trajectory_collection,
@@ -779,6 +931,8 @@ def main() -> None:
             loss_history=loss_history,
             best_loss=best_loss,
             body_q_frames=None,
+            learned_point_friction_override=learned_point_friction_override,
+            extra_result_arrays=extra_result_arrays,
         )
 
         if wandb_run is not None:

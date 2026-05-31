@@ -57,6 +57,19 @@ def save_training_checkpoint(
         trajectory_npz_path=np.asarray(str(args.trajectory_npz.resolve())),
         max_steps=np.asarray(-1 if args.max_steps is None else int(args.max_steps), dtype=np.int32),
         max_trajectories=np.asarray(-1 if args.max_trajectories is None else int(args.max_trajectories), dtype=np.int32),
+        dino_feature_npz_path=np.asarray(
+            "" if getattr(args, "dino_feature_npz", None) is None else str(args.dino_feature_npz)
+        ),
+        dino_neighbor_radius=np.asarray(float(getattr(args, "dino_neighbor_radius", 0.0)), dtype=np.float32),
+        dino_neighbor_k=np.asarray(int(getattr(args, "dino_neighbor_k", 0)), dtype=np.int32),
+        dino_position_frequencies=np.asarray(int(getattr(args, "dino_position_frequencies", 0)), dtype=np.int32),
+        dino_mlp_hidden_dim=np.asarray(int(getattr(args, "dino_mlp_hidden_dim", 0)), dtype=np.int32),
+        dino_mlp_hidden_layers=np.asarray(int(getattr(args, "dino_mlp_hidden_layers", 0)), dtype=np.int32),
+        dino_mlp_max_match_distance=np.asarray(
+            float(getattr(args, "dino_mlp_max_match_distance", 0.0)),
+            dtype=np.float32,
+        ),
+        dino_feature_normalization=np.asarray(bool(getattr(args, "dino_feature_normalization", False))),
     )
 
 
@@ -264,5 +277,4 @@ def load_training_checkpoint(
         rng.bit_generator.state = rng_state
 
     return iteration, active_params, adam_m, adam_v, adam_step, best_loss, best_active_params, loss_history
-
 

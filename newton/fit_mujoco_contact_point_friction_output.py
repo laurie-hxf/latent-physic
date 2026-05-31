@@ -22,13 +22,24 @@ def export_contact_friction_outputs(
     loss_history: list[float],
     best_loss: float,
     body_q_frames: list[np.ndarray] | None = None,
+    learned_point_friction_override: np.ndarray | None = None,
+    extra_result_arrays: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
-    learned_point_friction = np.full(
-        len(diff_scene.local_surface_points_np),
-        float(args.point_friction),
-        dtype=np.float32,
-    )
-    learned_point_friction[active_indices] = best_active_params
+    if learned_point_friction_override is None:
+        learned_point_friction = np.full(
+            len(diff_scene.local_surface_points_np),
+            float(args.point_friction),
+            dtype=np.float32,
+        )
+        learned_point_friction[active_indices] = best_active_params
+    else:
+        learned_point_friction = np.asarray(learned_point_friction_override, dtype=np.float32)
+        expected_shape = (len(diff_scene.local_surface_points_np),)
+        if learned_point_friction.shape != expected_shape:
+            raise ValueError(
+                f"learned_point_friction_override has shape {learned_point_friction.shape}, "
+                f"expected {expected_shape}"
+            )
 
     save_contact_friction_point_cloud(
         local_surface_points=diff_scene.local_surface_points_np,
@@ -40,6 +51,7 @@ def export_contact_friction_outputs(
     )
 
     args.results_path.parent.mkdir(parents=True, exist_ok=True)
+    result_arrays = {} if extra_result_arrays is None else dict(extra_result_arrays)
     np.savez_compressed(
         args.results_path,
         trajectory_npz_path=np.asarray(str(args.trajectory_npz)),
@@ -78,6 +90,7 @@ def export_contact_friction_outputs(
         loss_history=np.asarray(loss_history, dtype=np.float32),
         best_loss=np.asarray(best_loss, dtype=np.float32),
         point_cloud_path=np.asarray(str(args.point_cloud_path)),
+        **result_arrays,
     )
 
     if args.scene_usd_path is not None:

@@ -306,14 +306,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-point-friction", type=float, default=2.0)
     parser.add_argument(
         "--friction-parameterization",
-        choices=("point", "left-right", "global", "base-delta"),
+        choices=("point", "left-right", "global", "base-delta", "dino-mlp"),
         default="point",
         help=(
             "Friction parameters to optimize. 'point' keeps one parameter per active surface point; "
             "'left-right' optimizes only two x-split parameters and broadcasts them to all active points; "
             "'global' optimizes one parameter shared by all active points; "
-            "'base-delta' optimizes [mu_base, delta_left, delta_right] and uses mu_base + delta_side."
+            "'base-delta' optimizes [mu_base, delta_left, delta_right] and uses mu_base + delta_side; "
+            "'dino-mlp' predicts per-point friction from encoded local position and neighboring DINO features."
         ),
+    )
+    parser.add_argument(
+        "--dino-feature-npz",
+        type=Path,
+        default=None,
+        help="NPZ from dino_point_features/run_block_force_dino_surface_points.py, required for dino-mlp.",
+    )
+    parser.add_argument("--dino-neighbor-radius", type=float, default=0.025)
+    parser.add_argument("--dino-neighbor-k", type=int, default=16)
+    parser.add_argument("--dino-position-frequencies", type=int, default=6)
+    parser.add_argument("--dino-mlp-hidden-dim", type=int, default=128)
+    parser.add_argument("--dino-mlp-hidden-layers", type=int, default=2)
+    parser.add_argument("--dino-mlp-max-match-distance", type=float, default=1.0e-5)
+    parser.add_argument(
+        "--no-dino-feature-normalization",
+        dest="dino_feature_normalization",
+        action="store_false",
+        default=True,
+        help="Disable per-dimension standardization of averaged DINO features before the MLP.",
     )
     parser.add_argument(
         "--left-right-delta-sum-zero",

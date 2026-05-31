@@ -108,7 +108,7 @@ def compute_piecewise_regularization_inputs_np(
 
 
 def validate_friction_parameterization(parameterization: str) -> str:
-    if parameterization not in {"point", "left-right", "global", "base-delta"}:
+    if parameterization not in {"point", "left-right", "global", "base-delta", "dino-mlp"}:
         raise ValueError(f"Unsupported friction parameterization: {parameterization!r}")
     return parameterization
 
@@ -344,5 +344,4 @@ def format_nonfinite_gradient_diagnostics(
         f"loss_min={loss_min:.6g} "
         f"loss_max={loss_max:.6g}"
     )
-
 
