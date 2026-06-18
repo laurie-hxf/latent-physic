@@ -146,6 +146,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orientation-loss-weight", type=float, default=0.0)
     parser.add_argument("--linear-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--angular-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--point-position-loss-reduction", choices=("sum", "mean"), default="mean")
     parser.add_argument("--trajectory-indices", type=int, nargs="*", default=None)
     parser.add_argument(
         "--all-trajectories",
@@ -198,7 +199,10 @@ def make_eval_args(args: argparse.Namespace) -> argparse.Namespace:
         orientation_loss_weight=float(args.orientation_loss_weight),
         linear_velocity_loss_weight=float(args.linear_velocity_loss_weight),
         angular_velocity_loss_weight=float(args.angular_velocity_loss_weight),
-        point_position_loss_reduction="mean",
+        pointnet_residual_gain=getattr(args, "pointnet_residual_gain", None),
+        pointnet_residual_output_mode=str(getattr(args, "pointnet_residual_output_mode", "checkpoint")),
+        stateful_reset_interval=getattr(args, "stateful_reset_interval", None),
+        point_position_loss_reduction=str(getattr(args, "point_position_loss_reduction", "mean")),
     )
 
 
@@ -431,6 +435,40 @@ def transform_batched_positions_from_states(
     return batched_positions
 
 
+def transform_batched_state_histories_from_states(
+    body_q_frames: list[np.ndarray],
+    body_qd_frames: list[np.ndarray],
+    box_body_ids: np.ndarray,
+    trajectories,
+) -> list[dict[str, np.ndarray]]:
+    histories: list[dict[str, np.ndarray]] = []
+    for batch_idx, trajectory in enumerate(trajectories):
+        body_id = int(box_body_ids[batch_idx])
+        frame_count = min(trajectory.num_frames, len(body_q_frames), len(body_qd_frames))
+        positions = np.empty((frame_count, 3), dtype=np.float32)
+        quaternions = np.empty((frame_count, 4), dtype=np.float32)
+        linear_velocity = np.empty((frame_count, 3), dtype=np.float32)
+        angular_velocity = np.empty((frame_count, 3), dtype=np.float32)
+        for frame_idx in range(frame_count):
+            pose = np.asarray(body_q_frames[frame_idx][body_id]).reshape(-1)
+            velocity = np.asarray(body_qd_frames[frame_idx][body_id]).reshape(-1)
+            if pose.size < 7 or velocity.size < 6:
+                raise ValueError(f"Unexpected rigid state shapes: pose={pose.shape}, velocity={velocity.shape}")
+            positions[frame_idx] = pose[:3]
+            quaternions[frame_idx] = pose[3:7]
+            linear_velocity[frame_idx] = velocity[:3]
+            angular_velocity[frame_idx] = velocity[3:6]
+        histories.append(
+            {
+                "positions": positions,
+                "quaternions_xyzw": quaternions,
+                "linear_velocity": linear_velocity,
+                "angular_velocity": angular_velocity,
+            }
+        )
+    return histories
+
+
 def rollout_positions(
     *,
     diff_scene,
@@ -470,9 +508,11 @@ def rollout_positions_for_trajectories(
     active_params: np.ndarray,
     initial_body_q: np.ndarray,
     initial_body_qd: np.ndarray,
-) -> tuple[list[np.ndarray], list[float]]:
+    return_state_histories: bool = False,
+) -> tuple[list[np.ndarray], list[float]] | tuple[list[np.ndarray], list[float], list[dict[str, np.ndarray]]]:
     all_positions: list[np.ndarray] = []
     all_losses: list[float] = []
+    all_state_histories: list[dict[str, np.ndarray]] = []
     eval_batch_size = max(int(eval_args.eval_batch_size), 1)
     for batch_start in range(0, len(trajectories), eval_batch_size):
         batch_trajectories = trajectories[batch_start: batch_start + eval_batch_size]
@@ -496,6 +536,10 @@ def rollout_positions_for_trajectories(
             state.body_q.numpy().copy()
             for state in diff_scene.states[: buffers.max_frames]
         ]
+        body_qd_frames = [
+            state.body_qd.numpy().copy()
+            for state in diff_scene.states[: buffers.max_frames]
+        ]
         all_positions.extend(
             transform_batched_positions_from_states(
                 body_q_frames,
@@ -503,7 +547,18 @@ def rollout_positions_for_trajectories(
                 batch_trajectories,
             )
         )
+        if return_state_histories:
+            all_state_histories.extend(
+                transform_batched_state_histories_from_states(
+                    body_q_frames,
+                    body_qd_frames,
+                    diff_scene.box_body_ids_np,
+                    batch_trajectories,
+                )
+            )
         all_losses.extend(float(value) for value in buffers.loss.numpy()[: len(batch_trajectories)])
+    if return_state_histories:
+        return all_positions, all_losses, all_state_histories
     return all_positions, all_losses
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import dataclass
+import html
+import json
 from pathlib import Path
 import sys
 
@@ -159,6 +161,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trail-frames", type=int, default=90)
     parser.add_argument("--force-arrow-length", type=float, default=0.045)
     parser.add_argument("--bitrate", type=int, default=2400)
+    parser.add_argument(
+        "--interactive-html",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also write an interactive HTML player next to the video. HTML is required for clickable legend behavior.",
+    )
+    parser.add_argument(
+        "--interactive-output",
+        type=Path,
+        default=None,
+        help="Path for the interactive HTML player. Defaults to the video output path with .html suffix.",
+    )
     args = parser.parse_args()
     args.run_specs = resolve_run_specs(args, parser)
     return args
@@ -299,6 +313,10 @@ def default_output_path(args: argparse.Namespace, checkpoint=None) -> Path:
     if len(specs) > 3:
         run_tag += f"_plus_{len(specs) - 3}"
     return ROOT / "outputs" / "comparison_videos" / f"{run_tag}_{param_tag}_traj_{int(args.trajectory_index):04d}.mp4"
+
+
+def default_interactive_output_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".html")
 
 
 def sanitize_filename(value: str) -> str:
@@ -812,6 +830,781 @@ def render_video(
     plt.close(fig)
 
 
+def finite_float(value: float, fallback: float = 0.0) -> float:
+    value = float(value)
+    return value if np.isfinite(value) else float(fallback)
+
+
+def build_interactive_payload(
+    *,
+    output_path: Path,
+    trajectory,
+    target_positions: np.ndarray,
+    target_quaternions: np.ndarray,
+    predictions: list[PredictionResult],
+    half_extents: np.ndarray,
+    fps: int,
+    frame_stride: int,
+    trail_frames: int,
+    force_arrow_length: float,
+) -> dict:
+    if not predictions:
+        raise ValueError("No predictions to render")
+    frame_count = min([len(target_positions), *(len(result.positions) for result in predictions)])
+    target_positions = np.asarray(target_positions[:frame_count], dtype=np.float32)
+    target_quaternions = normalize_quaternions_xyzw(target_quaternions[:frame_count])
+    frame_indices = build_frame_indices(frame_count, frame_stride)
+    times = np.asarray(trajectory.time[:frame_count], dtype=np.float32)
+
+    target_yaw = np.asarray([yaw_from_xyzw(q) for q in target_quaternions], dtype=np.float32)
+    target_corners = np.asarray(
+        [block_corners_xy(target_positions[i], target_quaternions[i], half_extents) for i in range(frame_count)],
+        dtype=np.float32,
+    )
+
+    local_force_point = np.asarray(trajectory.force_point_offset_local, dtype=np.float32)
+    force_points_xy = np.asarray(
+        [
+            transform_local_point(target_positions[i], target_quaternions[i], local_force_point)[:2]
+            for i in range(frame_count)
+        ],
+        dtype=np.float32,
+    )
+    forces_xy = np.zeros((frame_count, 2), dtype=np.float32)
+    if len(trajectory.step_forces) > 0:
+        used = min(frame_count, len(trajectory.step_forces))
+        forces_xy[:used] = np.asarray(trajectory.step_forces[:used, :2], dtype=np.float32)
+        if used < frame_count:
+            forces_xy[used:] = forces_xy[used - 1]
+    force_norm_flat = np.linalg.norm(forces_xy, axis=1)
+    force_norm = force_norm_flat.reshape(-1, 1)
+    force_active = force_norm_flat > 1.0e-6
+    force_directions = np.divide(forces_xy, np.maximum(force_norm, 1.0e-8))
+    force_vectors = force_directions * float(force_arrow_length)
+    held_force_vectors = force_vectors.copy()
+    held_force_points_xy = force_points_xy.copy()
+    last_active_idx = -1
+    for frame_idx in range(frame_count):
+        if force_active[frame_idx]:
+            last_active_idx = frame_idx
+        elif last_active_idx >= 0:
+            held_force_vectors[frame_idx] = force_vectors[last_active_idx]
+            held_force_points_xy[frame_idx] = force_points_xy[last_active_idx]
+
+    methods = []
+    all_xy = [target_positions[:, :2], target_corners.reshape(-1, 2), force_points_xy]
+    for run_idx, result in enumerate(predictions):
+        positions = np.asarray(result.positions[:frame_count], dtype=np.float32)
+        quaternions = normalize_quaternions_xyzw(result.quaternions[:frame_count])
+        corners = np.asarray(
+            [block_corners_xy(positions[i], quaternions[i], half_extents) for i in range(frame_count)],
+            dtype=np.float32,
+        )
+        xy_error = np.linalg.norm(positions[:, :2] - target_positions[:, :2], axis=1)
+        yaw_error_deg = np.abs(
+            np.rad2deg(
+                wrap_angle_radians(np.asarray([yaw_from_xyzw(q) for q in quaternions], dtype=np.float32) - target_yaw)
+            )
+        )
+        color = PALETTE[run_idx % len(PALETTE)]
+        methods.append(
+            {
+                "id": f"m{run_idx}",
+                "label": result.label,
+                "legendLabel": result.legend_label,
+                "color": color,
+                "checkpoint": str(result.checkpoint_path),
+                "parameterSource": result.parameter_source,
+                "parameterSummary": result.parameter_summary,
+                "meanLoss": finite_float(result.mean_loss),
+                "positionLoss": finite_float(result.position_loss),
+                "orientationLoss": finite_float(result.orientation_loss),
+                "linearVelocityLoss": finite_float(result.linear_velocity_loss),
+                "angularVelocityLoss": finite_float(result.angular_velocity_loss),
+                "finalXyError": finite_float(result.final_xy_error),
+                "positions": positions[:, :2].astype(float).tolist(),
+                "corners": corners.astype(float).tolist(),
+                "xyError": xy_error.astype(float).tolist(),
+                "yawErrorDeg": yaw_error_deg.astype(float).tolist(),
+            }
+        )
+        all_xy.extend([positions[:, :2], corners.reshape(-1, 2)])
+
+    xy = np.vstack(all_xy)
+    xy_min = np.min(xy, axis=0)
+    xy_max = np.max(xy, axis=0)
+    center = 0.5 * (xy_min + xy_max)
+    radius = 0.5 * max(float(np.max(xy_max - xy_min)), 0.08)
+    pad = max(0.02, radius * 0.18)
+    bounds = {
+        "xMin": finite_float(center[0] - radius - pad),
+        "xMax": finite_float(center[0] + radius + pad),
+        "yMin": finite_float(center[1] - radius - pad),
+        "yMax": finite_float(center[1] + radius + pad),
+    }
+
+    return {
+        "title": f"MuJoCo vs Newton trajectory | {len(predictions)} checkpoint(s)",
+        "videoOutput": str(output_path),
+        "fps": max(int(fps), 1),
+        "trailFrames": max(int(trail_frames), 1),
+        "frameCount": int(frame_count),
+        "frameIndices": frame_indices.astype(int).tolist(),
+        "times": times.astype(float).tolist(),
+        "bounds": bounds,
+        "target": {
+            "label": "MuJoCo ground truth",
+            "positions": target_positions[:, :2].astype(float).tolist(),
+            "corners": target_corners.astype(float).tolist(),
+        },
+        "force": {
+            "points": force_points_xy.astype(float).tolist(),
+            "vectors": force_vectors.astype(float).tolist(),
+            "heldPoints": held_force_points_xy.astype(float).tolist(),
+            "heldVectors": held_force_vectors.astype(float).tolist(),
+            "active": force_active.astype(bool).tolist(),
+            "norm": force_norm_flat.astype(float).tolist(),
+            "xy": forces_xy.astype(float).tolist(),
+        },
+        "methods": methods,
+    }
+
+
+def render_interactive_html(
+    *,
+    output_path: Path,
+    video_output_path: Path,
+    trajectory,
+    target_positions: np.ndarray,
+    target_quaternions: np.ndarray,
+    predictions: list[PredictionResult],
+    half_extents: np.ndarray,
+    fps: int,
+    frame_stride: int,
+    trail_frames: int,
+    force_arrow_length: float,
+) -> None:
+    payload = build_interactive_payload(
+        output_path=video_output_path,
+        trajectory=trajectory,
+        target_positions=target_positions,
+        target_quaternions=target_quaternions,
+        predictions=predictions,
+        half_extents=half_extents,
+        fps=fps,
+        frame_stride=frame_stride,
+        trail_frames=trail_frames,
+        force_arrow_length=force_arrow_length,
+    )
+    payload_json = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    payload_json = (
+        payload_json.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    legend_rows = []
+    for idx, method in enumerate(payload["methods"]):
+        legend_rows.append(
+            "<button class=\"legend-row\" type=\"button\" "
+            f"data-method=\"{idx}\" title=\"{html.escape(method['checkpoint'], quote=True)}\">"
+            f"<span class=\"legend-swatch\" style=\"background:{html.escape(method['color'], quote=True)}\"></span>"
+            f"<span class=\"legend-index\">{idx + 1}</span>"
+            f"<span class=\"legend-text\">{html.escape(method['legendLabel'])}</span>"
+            f"<span class=\"legend-loss\">loss {method['meanLoss']:.4g}</span>"
+            "</button>"
+        )
+    html_text = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(payload["title"])}</title>
+<style>
+:root {{ color-scheme: light; }}
+body {{
+  margin: 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #1f2933;
+  background: #f6f8fb;
+}}
+.page {{ padding: 18px 22px 28px; }}
+h1 {{ margin: 0 0 6px; font-size: 18px; font-weight: 650; }}
+.meta {{ color: #5b6673; font-size: 12px; margin-bottom: 12px; }}
+.layout {{
+  display: grid;
+  grid-template-columns: minmax(720px, 1fr) 390px;
+  gap: 14px;
+  align-items: start;
+}}
+.viewer, .side {{
+  background: #fff;
+  border: 1px solid #d8dee8;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+}}
+.viewer {{ overflow: hidden; }}
+.toolbar {{
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e5eaf1;
+  color: #475467;
+  font-size: 12px;
+}}
+button {{
+  border: 1px solid #cfd7e3;
+  background: #fff;
+  border-radius: 6px;
+  padding: 5px 9px;
+  cursor: pointer;
+  font: inherit;
+  color: #1f2933;
+}}
+button:hover {{ background: #f4f7fb; }}
+input[type="range"] {{ width: 100%; }}
+.canvas-wrap {{ padding: 10px; }}
+canvas {{ display: block; width: 100%; background: #fff; }}
+#sceneCanvas {{ border: 1px solid #e1e6ef; border-radius: 6px 6px 0 0; }}
+#errorCanvas {{ border: 1px solid #e1e6ef; border-top: 0; border-radius: 0 0 6px 6px; }}
+.side {{ padding: 12px; }}
+.side h2 {{ margin: 0 0 8px; font-size: 13px; font-weight: 700; }}
+.legend-list {{ display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }}
+.legend-row {{
+  display: grid;
+  grid-template-columns: 18px 22px 1fr auto;
+  gap: 7px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  border-color: transparent;
+  padding: 7px 7px;
+  opacity: 0.76;
+}}
+.legend-swatch {{ width: 14px; height: 14px; border-radius: 50%; box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.7); }}
+.legend-index {{ font-size: 11px; font-weight: 700; color: #475467; }}
+.legend-text {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }}
+.legend-loss {{ color: #667085; font-size: 11px; }}
+.legend-row.dimmed {{ opacity: 0.28; }}
+.legend-row.active {{
+  opacity: 1;
+  border-color: rgba(37, 99, 235, 0.24);
+  background: rgba(37, 99, 235, 0.07);
+}}
+.legend-row.pinned {{
+  border-color: rgba(16, 24, 40, 0.28);
+  background: rgba(16, 24, 40, 0.05);
+}}
+.info {{
+  min-height: 106px;
+  padding: 9px 10px;
+  border: 1px solid #e1e6ef;
+  border-radius: 6px;
+  background: #fbfcfe;
+  color: #344054;
+  font-size: 12px;
+  line-height: 1.42;
+}}
+@media (max-width: 1160px) {{
+  .layout {{ grid-template-columns: 1fr; }}
+}}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>{html.escape(payload["title"])}</h1>
+  <div class="meta">Interactive companion for {html.escape(str(video_output_path))}</div>
+  <div class="layout">
+    <div class="viewer">
+      <div class="toolbar">
+        <button id="playPause" type="button">Pause</button>
+        <input id="frameSlider" type="range" min="0" max="{len(payload["frameIndices"]) - 1}" value="0" step="1">
+        <span id="timeReadout">frame 0</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="sceneCanvas" width="1120" height="650"></canvas>
+        <canvas id="errorCanvas" width="1120" height="210"></canvas>
+      </div>
+    </div>
+    <aside class="side">
+      <h2>Legend</h2>
+      <div class="legend-list">
+        {''.join(legend_rows)}
+      </div>
+      <button id="resetHighlights" type="button">Reset highlights</button>
+      <div id="info" class="info"></div>
+    </aside>
+  </div>
+</div>
+<script id="comparisonData" type="application/json">{payload_json}</script>
+<script>
+const payload = JSON.parse(document.getElementById('comparisonData').textContent);
+const sceneCanvas = document.getElementById('sceneCanvas');
+const errorCanvas = document.getElementById('errorCanvas');
+const sceneCtx = sceneCanvas.getContext('2d');
+const errorCtx = errorCanvas.getContext('2d');
+const slider = document.getElementById('frameSlider');
+const playPause = document.getElementById('playPause');
+const timeReadout = document.getElementById('timeReadout');
+const info = document.getElementById('info');
+const legendRows = Array.from(document.querySelectorAll('.legend-row'));
+const pinnedMethods = new Set();
+let hoverMethod = null;
+let frameCursor = 0;
+let playing = true;
+let lastTick = 0;
+
+const scenePlot = computeScenePlot();
+const errorPlot = {{ x: 58, y: 20, width: errorCanvas.width - 92, height: errorCanvas.height - 58 }};
+const maxError = computeMaxError();
+const maxForce = computeMaxForce();
+const timeMin = payload.times[0] ?? 0.0;
+const timeMax = payload.times[payload.times.length - 1] ?? (timeMin + 1e-3);
+
+function computeMaxError() {{
+  let value = 1e-4;
+  payload.methods.forEach(method => {{
+    method.xyError.forEach(error => {{
+      if (Number.isFinite(error) && error > value) value = error;
+    }});
+  }});
+  return value;
+}}
+
+function computeMaxForce() {{
+  let value = 1.0;
+  payload.force.norm.forEach(force => {{
+    if (Number.isFinite(force) && force > value) value = force;
+  }});
+  return value;
+}}
+
+function computeScenePlot() {{
+  const margin = {{ left: 64, right: 32, top: 28, bottom: 48 }};
+  const availableW = sceneCanvas.width - margin.left - margin.right;
+  const availableH = sceneCanvas.height - margin.top - margin.bottom;
+  const bounds = payload.bounds;
+  const xSpan = bounds.xMax - bounds.xMin;
+  const ySpan = bounds.yMax - bounds.yMin;
+  const scale = Math.min(availableW / xSpan, availableH / ySpan);
+  const width = xSpan * scale;
+  const height = ySpan * scale;
+  return {{
+    x: margin.left + (availableW - width) * 0.5,
+    y: margin.top + (availableH - height) * 0.5,
+    width,
+    height,
+    scale,
+  }};
+}}
+
+function colorAlpha(hex, alpha) {{
+  const value = hex.replace('#', '');
+  const r = parseInt(value.slice(0, 2), 16);
+  const g = parseInt(value.slice(2, 4), 16);
+  const b = parseInt(value.slice(4, 6), 16);
+  return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+}}
+
+function worldToScene(point) {{
+  const bounds = payload.bounds;
+  return [
+    scenePlot.x + (point[0] - bounds.xMin) * scenePlot.scale,
+    scenePlot.y + scenePlot.height - (point[1] - bounds.yMin) * scenePlot.scale,
+  ];
+}}
+
+function timeToX(time) {{
+  const span = Math.max(timeMax - timeMin, 1e-8);
+  return errorPlot.x + ((time - timeMin) / span) * errorPlot.width;
+}}
+
+function errorToY(value) {{
+  return errorPlot.y + errorPlot.height - (value / maxError) * errorPlot.height;
+}}
+
+function forceToY(value) {{
+  return errorPlot.y + errorPlot.height - (value / maxForce) * errorPlot.height;
+}}
+
+function hasHighlight() {{
+  return pinnedMethods.size > 0 || hoverMethod !== null;
+}}
+
+function methodIsActive(idx) {{
+  if (pinnedMethods.size > 0) return pinnedMethods.has(idx);
+  if (hoverMethod !== null) return hoverMethod === idx;
+  return false;
+}}
+
+function methodStyle(idx) {{
+  const highlighted = hasHighlight();
+  const active = methodIsActive(idx);
+  if (!highlighted) {{
+    return {{ fullAlpha: 0.16, trailAlpha: 0.86, lineWidth: 2.2, boxFill: 0.18, boxStroke: 0.82, boxWidth: 1.8 }};
+  }}
+  if (active) {{
+    return {{ fullAlpha: 0.42, trailAlpha: 1.0, lineWidth: 4.2, boxFill: 0.48, boxStroke: 1.0, boxWidth: 4.2 }};
+  }}
+  return {{ fullAlpha: 0.045, trailAlpha: 0.09, lineWidth: 1.4, boxFill: 0.045, boxStroke: 0.12, boxWidth: 1.1 }};
+}}
+
+function drawPolyline(ctx, points, start, end, color, width, alpha, dash = []) {{
+  if (!points.length || end < start) return;
+  ctx.save();
+  ctx.strokeStyle = colorAlpha(color, alpha);
+  ctx.lineWidth = width;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  for (let i = start; i <= end; i++) {{
+    const [x, y] = worldToScene(points[i]);
+    if (i === start) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }}
+  ctx.stroke();
+  ctx.restore();
+}}
+
+function drawPlotPolyline(ctx, values, mapX, mapY, color, width, alpha, dash = []) {{
+  if (!values.length) return;
+  ctx.save();
+  ctx.strokeStyle = colorAlpha(color, alpha);
+  ctx.lineWidth = width;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  for (let i = 0; i < values.length; i++) {{
+    const x = mapX(i);
+    const y = mapY(values[i]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }}
+  ctx.stroke();
+  ctx.restore();
+}}
+
+function drawPolygon(ctx, corners, color, fillAlpha, strokeAlpha, width) {{
+  if (!corners.length) return;
+  ctx.save();
+  ctx.fillStyle = colorAlpha(color, fillAlpha);
+  ctx.strokeStyle = colorAlpha(color, strokeAlpha);
+  ctx.lineWidth = width;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  corners.forEach((point, idx) => {{
+    const [x, y] = worldToScene(point);
+    if (idx === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }});
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}}
+
+function drawMarker(ctx, point, color, radius, alpha) {{
+  const [x, y] = worldToScene(point);
+  ctx.save();
+  ctx.fillStyle = colorAlpha(color, alpha);
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}}
+
+function drawArrow(ctx, point, vector, active) {{
+  if (!point || !vector) return;
+  const endPoint = [point[0] + vector[0], point[1] + vector[1]];
+  const [sx, sy] = worldToScene(point);
+  const [ex, ey] = worldToScene(endPoint);
+  const dx = ex - sx;
+  const dy = ey - sy;
+  if (Math.hypot(dx, dy) < 1e-5) return;
+  const angle = Math.atan2(dy, dx);
+  const alpha = active ? 1.0 : 0.34;
+  const color = active ? '#0077bb' : '#999999';
+  ctx.save();
+  ctx.strokeStyle = colorAlpha(color, alpha);
+  ctx.fillStyle = colorAlpha(color, alpha);
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - 14 * Math.cos(angle - 0.45), ey - 14 * Math.sin(angle - 0.45));
+  ctx.lineTo(ex - 14 * Math.cos(angle + 0.45), ey - 14 * Math.sin(angle + 0.45));
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(sx, sy, 5.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}}
+
+function drawSceneGrid() {{
+  sceneCtx.clearRect(0, 0, sceneCanvas.width, sceneCanvas.height);
+  sceneCtx.fillStyle = '#ffffff';
+  sceneCtx.fillRect(0, 0, sceneCanvas.width, sceneCanvas.height);
+  sceneCtx.fillStyle = '#fbfcfe';
+  sceneCtx.strokeStyle = '#d8dee8';
+  sceneCtx.lineWidth = 1;
+  sceneCtx.fillRect(scenePlot.x, scenePlot.y, scenePlot.width, scenePlot.height);
+  sceneCtx.strokeRect(scenePlot.x, scenePlot.y, scenePlot.width, scenePlot.height);
+  sceneCtx.strokeStyle = '#edf1f7';
+  sceneCtx.fillStyle = '#667085';
+  sceneCtx.font = '11px Inter, sans-serif';
+  sceneCtx.textAlign = 'center';
+  sceneCtx.textBaseline = 'top';
+  const bounds = payload.bounds;
+  for (let tick = 0; tick <= 4; tick++) {{
+    const fx = tick / 4;
+    const x = scenePlot.x + fx * scenePlot.width;
+    const y = scenePlot.y + (tick / 4) * scenePlot.height;
+    sceneCtx.beginPath();
+    sceneCtx.moveTo(x, scenePlot.y);
+    sceneCtx.lineTo(x, scenePlot.y + scenePlot.height);
+    sceneCtx.moveTo(scenePlot.x, y);
+    sceneCtx.lineTo(scenePlot.x + scenePlot.width, y);
+    sceneCtx.stroke();
+    const worldX = bounds.xMin + fx * (bounds.xMax - bounds.xMin);
+    const worldY = bounds.yMax - fx * (bounds.yMax - bounds.yMin);
+    sceneCtx.fillText(worldX.toFixed(3), x, scenePlot.y + scenePlot.height + 8);
+    sceneCtx.save();
+    sceneCtx.textAlign = 'right';
+    sceneCtx.textBaseline = 'middle';
+    sceneCtx.fillText(worldY.toFixed(3), scenePlot.x - 8, y);
+    sceneCtx.restore();
+  }}
+  sceneCtx.fillStyle = '#344054';
+  sceneCtx.textAlign = 'right';
+  sceneCtx.textBaseline = 'bottom';
+  sceneCtx.fillText('world x/y (m)', scenePlot.x + scenePlot.width, scenePlot.y - 8);
+}}
+
+function drawErrorGrid() {{
+  errorCtx.clearRect(0, 0, errorCanvas.width, errorCanvas.height);
+  errorCtx.fillStyle = '#ffffff';
+  errorCtx.fillRect(0, 0, errorCanvas.width, errorCanvas.height);
+  errorCtx.fillStyle = '#fbfcfe';
+  errorCtx.strokeStyle = '#d8dee8';
+  errorCtx.lineWidth = 1;
+  errorCtx.fillRect(errorPlot.x, errorPlot.y, errorPlot.width, errorPlot.height);
+  errorCtx.strokeRect(errorPlot.x, errorPlot.y, errorPlot.width, errorPlot.height);
+  errorCtx.strokeStyle = '#edf1f7';
+  errorCtx.font = '11px Inter, sans-serif';
+  errorCtx.fillStyle = '#667085';
+  for (let tick = 0; tick <= 4; tick++) {{
+    const x = errorPlot.x + (tick / 4) * errorPlot.width;
+    const y = errorPlot.y + (tick / 4) * errorPlot.height;
+    errorCtx.beginPath();
+    errorCtx.moveTo(x, errorPlot.y);
+    errorCtx.lineTo(x, errorPlot.y + errorPlot.height);
+    errorCtx.moveTo(errorPlot.x, y);
+    errorCtx.lineTo(errorPlot.x + errorPlot.width, y);
+    errorCtx.stroke();
+    const time = timeMin + (tick / 4) * (timeMax - timeMin);
+    const err = maxError * (1 - tick / 4);
+    errorCtx.textAlign = 'center';
+    errorCtx.textBaseline = 'top';
+    errorCtx.fillText(time.toFixed(2), x, errorPlot.y + errorPlot.height + 7);
+    errorCtx.textAlign = 'right';
+    errorCtx.textBaseline = 'middle';
+    errorCtx.fillText(err.toExponential(1), errorPlot.x - 8, y);
+  }}
+  errorCtx.fillStyle = '#344054';
+  errorCtx.textAlign = 'left';
+  errorCtx.textBaseline = 'top';
+  errorCtx.fillText('xy error (m)', errorPlot.x, 4);
+  errorCtx.fillStyle = '#0077bb';
+  errorCtx.textAlign = 'right';
+  errorCtx.fillText('|force| (N)', errorPlot.x + errorPlot.width, 4);
+}}
+
+function drawErrorPanel(frameIdx) {{
+  drawErrorGrid();
+  payload.methods.forEach((method, idx) => {{
+    const style = methodStyle(idx);
+    const active = hasHighlight() && methodIsActive(idx);
+    drawPlotPolyline(
+      errorCtx,
+      method.xyError,
+      i => timeToX(payload.times[i]),
+      value => errorToY(value),
+      method.color,
+      active ? 3.2 : 1.5,
+      active ? 1.0 : style.fullAlpha * 2.5
+    );
+  }});
+  drawPlotPolyline(
+    errorCtx,
+    payload.force.norm,
+    i => timeToX(payload.times[i]),
+    value => forceToY(value),
+    '#0077bb',
+    1.5,
+    0.62,
+    [5, 4]
+  );
+  const t = payload.times[frameIdx];
+  const x = timeToX(t);
+  errorCtx.save();
+  errorCtx.strokeStyle = 'rgba(85, 85, 85, 0.72)';
+  errorCtx.lineWidth = 1.2;
+  errorCtx.beginPath();
+  errorCtx.moveTo(x, errorPlot.y);
+  errorCtx.lineTo(x, errorPlot.y + errorPlot.height);
+  errorCtx.stroke();
+  errorCtx.restore();
+  payload.methods.forEach((method, idx) => {{
+    const active = !hasHighlight() || methodIsActive(idx);
+    const radius = hasHighlight() && methodIsActive(idx) ? 4.7 : 3.3;
+    errorCtx.save();
+    errorCtx.fillStyle = colorAlpha(method.color, active ? 1.0 : 0.18);
+    errorCtx.beginPath();
+    errorCtx.arc(x, errorToY(method.xyError[frameIdx]), radius, 0, Math.PI * 2);
+    errorCtx.fill();
+    errorCtx.restore();
+  }});
+}}
+
+function drawScene(frameIdx) {{
+  drawSceneGrid();
+  const trailStart = Math.max(0, frameIdx - payload.trailFrames);
+  drawPolyline(sceneCtx, payload.target.positions, 0, payload.target.positions.length - 1, '#222222', 2.2, 0.14);
+  payload.methods.forEach((method, idx) => {{
+    const style = methodStyle(idx);
+    drawPolyline(sceneCtx, method.positions, 0, method.positions.length - 1, method.color, 1.8, style.fullAlpha, [7, 5]);
+  }});
+  drawPolyline(sceneCtx, payload.target.positions, trailStart, frameIdx, '#222222', 3.1, 0.94);
+  drawPolygon(sceneCtx, payload.target.corners[frameIdx], '#222222', 0.0, 1.0, 2.5);
+  drawMarker(sceneCtx, payload.target.positions[frameIdx], '#222222', 5, 1.0);
+  payload.methods.forEach((method, idx) => {{
+    const style = methodStyle(idx);
+    drawPolyline(sceneCtx, method.positions, trailStart, frameIdx, method.color, style.lineWidth, style.trailAlpha, [8, 5]);
+    drawPolygon(sceneCtx, method.corners[frameIdx], method.color, style.boxFill, style.boxStroke, style.boxWidth);
+    drawMarker(sceneCtx, method.positions[frameIdx], method.color, hasHighlight() && methodIsActive(idx) ? 6 : 4.2, style.trailAlpha);
+  }});
+  const active = payload.force.active[frameIdx];
+  const forcePoint = active ? payload.force.points[frameIdx] : payload.force.heldPoints[frameIdx];
+  const forceVector = active ? payload.force.vectors[frameIdx] : payload.force.heldVectors[frameIdx];
+  drawArrow(sceneCtx, forcePoint, forceVector, active);
+}}
+
+function updateLegendState() {{
+  legendRows.forEach(row => {{
+    const idx = Number(row.dataset.method);
+    const active = methodIsActive(idx);
+    row.classList.toggle('active', active);
+    row.classList.toggle('pinned', pinnedMethods.has(idx));
+    row.classList.toggle('dimmed', hasHighlight() && !active);
+  }});
+}}
+
+function updateInfo(frameIdx) {{
+  const errors = payload.methods.map((method, idx) => [idx, method.xyError[frameIdx]]);
+  errors.sort((a, b) => a[1] - b[1]);
+  const best = payload.methods[errors[0][0]];
+  const forceState = payload.force.active[frameIdx] ? 'on' : 'off';
+  const t = payload.times[frameIdx] ?? 0.0;
+  timeReadout.textContent = `frame ${{frameIdx}}/${{payload.frameCount - 1}} | t=${{t.toFixed(3)}}s`;
+  info.innerHTML =
+    `<strong>frame</strong> ${{frameIdx}}/${{payload.frameCount - 1}} &nbsp; <strong>t</strong> ${{t.toFixed(3)}}s<br>` +
+    `<strong>force</strong> ${{forceState}} | |F|=${{payload.force.norm[frameIdx].toFixed(2)}} N ` +
+    `Fx=${{payload.force.xy[frameIdx][0].toFixed(2)}} Fy=${{payload.force.xy[frameIdx][1].toFixed(2)}}<br>` +
+    `<strong>best xy</strong> ${{best.label}} (${{(errors[0][1] * 1000).toFixed(2)}} mm)<br>` +
+    `<strong>loss</strong> ${{best.meanLoss.toPrecision(5)}}`;
+}}
+
+function draw() {{
+  const frameIdx = payload.frameIndices[frameCursor];
+  slider.value = String(frameCursor);
+  updateLegendState();
+  drawScene(frameIdx);
+  drawErrorPanel(frameIdx);
+  updateInfo(frameIdx);
+}}
+
+function step(timestamp) {{
+  if (!lastTick) lastTick = timestamp;
+  if (playing && timestamp - lastTick >= 1000 / payload.fps) {{
+    frameCursor = (frameCursor + 1) % payload.frameIndices.length;
+    lastTick = timestamp;
+    draw();
+  }}
+  requestAnimationFrame(step);
+}}
+
+function clearHighlights() {{
+  pinnedMethods.clear();
+  hoverMethod = null;
+  draw();
+}}
+
+legendRows.forEach(row => {{
+  row.addEventListener('mouseenter', () => {{
+    if (pinnedMethods.size === 0) {{
+      hoverMethod = Number(row.dataset.method);
+      draw();
+    }}
+  }});
+  row.addEventListener('mouseleave', () => {{
+    if (pinnedMethods.size === 0) {{
+      hoverMethod = null;
+      draw();
+    }}
+  }});
+  row.addEventListener('click', event => {{
+    event.stopPropagation();
+    const idx = Number(row.dataset.method);
+    if (pinnedMethods.has(idx)) pinnedMethods.delete(idx);
+    else pinnedMethods.add(idx);
+    hoverMethod = null;
+    draw();
+  }});
+}});
+
+slider.addEventListener('input', () => {{
+  frameCursor = Number(slider.value);
+  draw();
+}});
+playPause.addEventListener('click', event => {{
+  event.stopPropagation();
+  playing = !playing;
+  playPause.textContent = playing ? 'Pause' : 'Play';
+}});
+document.getElementById('resetHighlights').addEventListener('click', event => {{
+  event.stopPropagation();
+  clearHighlights();
+}});
+document.addEventListener('click', clearHighlights);
+document.addEventListener('keydown', event => {{
+  if (event.key === 'Escape') clearHighlights();
+  if (event.key === ' ') {{
+    event.preventDefault();
+    playing = !playing;
+    playPause.textContent = playing ? 'Pause' : 'Play';
+  }}
+}});
+
+draw();
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
+"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html_text, encoding="utf-8")
+
+
 def run_prediction(
     *,
     args: argparse.Namespace,
@@ -981,6 +1774,26 @@ def main() -> None:
         bitrate=args.bitrate,
     )
     log_message(f"video_written_to={output_path.resolve()}")
+
+    if args.interactive_html:
+        interactive_output_path = (
+            args.interactive_output if args.interactive_output is not None else default_interactive_output_path(output_path)
+        )
+        log_message(f"rendering interactive HTML to {interactive_output_path.resolve()}")
+        render_interactive_html(
+            output_path=interactive_output_path,
+            video_output_path=output_path,
+            trajectory=trajectory,
+            target_positions=trajectory.positions,
+            target_quaternions=trajectory.quaternions_xyzw,
+            predictions=predictions,
+            half_extents=half_extents,
+            fps=args.fps,
+            frame_stride=args.frame_stride,
+            trail_frames=args.trail_frames,
+            force_arrow_length=args.force_arrow_length,
+        )
+        log_message(f"interactive_html_written_to={interactive_output_path.resolve()}")
 
 
 if __name__ == "__main__":
