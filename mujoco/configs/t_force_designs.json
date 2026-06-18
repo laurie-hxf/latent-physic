@@ -1,0 +1,35 @@
+{
+  "designs": {
+    "left_right": {
+      "description": "Simple two-region T: low-friction left half and high-friction right half.",
+      "thickness": 0.05,
+      "density": 1000.0,
+      "parts": [
+        {"name": "cap_left", "center_xy": [-0.06, 0.08], "size_xy": [0.12, 0.06], "friction": 0.20},
+        {"name": "cap_right", "center_xy": [0.06, 0.08], "size_xy": [0.12, 0.06], "friction": 0.60},
+        {"name": "stem_left", "center_xy": [-0.015, -0.03], "size_xy": [0.03, 0.16], "friction": 0.20},
+        {"name": "stem_right", "center_xy": [0.015, -0.03], "size_xy": [0.03, 0.16], "friction": 0.60}
+      ]
+    },
+    "top_bottom": {
+      "description": "Simple two-region T: low-friction top bar and high-friction vertical stem.",
+      "thickness": 0.05,
+      "density": 1000.0,
+      "parts": [
+        {"name": "top", "center_xy": [0.0, 0.08], "size_xy": [0.24, 0.06], "friction": 0.20},
+        {"name": "bottom", "center_xy": [0.0, -0.03], "size_xy": [0.06, 0.16], "friction": 0.60}
+      ]
+    },
+    "ends_center": {
+      "description": "Simple three-region T: left end, center plus stem, and right end.",
+      "thickness": 0.05,
+      "density": 1000.0,
+      "parts": [
+        {"name": "left_end", "center_xy": [-0.08, 0.08], "size_xy": [0.08, 0.06], "friction": 0.20},
+        {"name": "center_top", "center_xy": [0.0, 0.08], "size_xy": [0.08, 0.06], "friction": 0.40},
+        {"name": "right_end", "center_xy": [0.08, 0.08], "size_xy": [0.08, 0.06], "friction": 0.65},
+        {"name": "center_stem", "center_xy": [0.0, -0.03], "size_xy": [0.06, 0.16], "friction": 0.40}
+      ]
+    }
+  }
+}
