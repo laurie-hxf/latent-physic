@@ -3,11 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +20,7 @@ for _path in (REPO_ROOT, NEWTON_DIR):
         sys.path.insert(0, _path_str)
 
 from fit_mujoco_contact_point_friction_kernels import (  # noqa: E402
+    scatter_active_point_friction_kernel,
     apply_batched_external_and_surface_point_forces_trajectory_kernel,
     compute_batched_contact_weighted_masses_kernel,
 )
@@ -55,6 +54,7 @@ from replay_mujoco_contact_friction_trajectory import (  # noqa: E402
     load_checkpoint_parameters,
     load_contact_friction_point_cloud,
 )
+from dino_mlp_warp_friction import build_warp_dino_mlp_friction_model  # noqa: E402
 
 from residual_dynamics_adapter.kernels import (  # noqa: E402
     HIDDEN0_DIM,
@@ -62,6 +62,9 @@ from residual_dynamics_adapter.kernels import (  # noqa: E402
     HIDDEN2_DIM,
     INPUT_DIM,
     OUTPUT_DIM,
+    RESIDUAL_OUTPUT_MODE_ACCELERATION,
+    RESIDUAL_OUTPUT_MODE_VELOCITY,
+    accumulate_active_mu_features_kernel,
     accumulate_optimizer_mu_features_kernel,
     accumulate_grad_norm_kernel,
     accumulate_residual_frame_loss_kernel,
@@ -85,40 +88,37 @@ DEFAULT_TRAIN_DATASET = (
     / "mujoco/outputs/rotation_friction_diagnostics_l0p20_r0p50_2000/"
     / "same_mean_split_left_0p20_right_0p50/same_mean_split_left_0p20_right_0p50.npz"
 )
-EXPERIMENT_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
-TIMESTAMPED_EXPERIMENT_NAME_RE = re.compile(r"^\d{8}_\d{6}_.+")
+RESIDUAL_OUTPUT_MODES = ("acceleration", "velocity")
 
 
-def _current_experiment_timestamp() -> str:
-    return datetime.now().astimezone().strftime(EXPERIMENT_TIMESTAMP_FORMAT)
+def normalize_residual_output_mode(value: object) -> str:
+    mode = str(value).strip().lower().replace("_", "-")
+    if mode not in RESIDUAL_OUTPUT_MODES:
+        raise ValueError(
+            f"Unsupported residual output mode {value!r}; expected one of: {', '.join(RESIDUAL_OUTPUT_MODES)}"
+        )
+    return mode
 
 
-def _apply_experiment_dir_timestamp(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    args.experiment_timestamp = None
-    args.requested_experiment_dir = args.experiment_dir
-    if not args.timestamp_experiment_dir:
-        return
+def residual_output_mode_id(value: object) -> int:
+    mode = normalize_residual_output_mode(value)
+    if mode == "velocity":
+        return RESIDUAL_OUTPUT_MODE_VELOCITY
+    return RESIDUAL_OUTPUT_MODE_ACCELERATION
 
-    experiment_dir = args.experiment_dir
-    experiment_name = experiment_dir.name
-    if not experiment_name:
-        parser.error("--experiment-dir must include a directory name.")
 
-    if TIMESTAMPED_EXPERIMENT_NAME_RE.match(experiment_name):
-        args.experiment_timestamp = experiment_name[:15]
-        return
-
-    timestamp = args.experiment_dir_timestamp or _current_experiment_timestamp()
-    if not timestamp or "/" in timestamp or "\\" in timestamp:
-        parser.error("--experiment-dir-timestamp must be a non-empty path-safe string.")
-
-    args.experiment_timestamp = timestamp
-    args.experiment_dir = experiment_dir.with_name(f"{timestamp}_{experiment_name}")
-    if (
-        args.wandb_run_name is not None
-        and not TIMESTAMPED_EXPERIMENT_NAME_RE.match(args.wandb_run_name)
-    ):
-        args.wandb_run_name = f"{timestamp}_{args.wandb_run_name}"
+def residual_output_mode_from_checkpoint(path: Path) -> str:
+    with np.load(path, allow_pickle=True) as data:
+        if "residual_output_mode" in data.files:
+            return normalize_residual_output_mode(np.asarray(data["residual_output_mode"]).item())
+        if "args_json" in data.files:
+            try:
+                args_payload = json.loads(str(np.asarray(data["args_json"]).item()))
+            except Exception:
+                args_payload = {}
+            if "residual_output_mode" in args_payload:
+                return normalize_residual_output_mode(args_payload["residual_output_mode"])
+    return "acceleration"
 
 
 @dataclass
@@ -217,6 +217,7 @@ class TrainableFriction:
     active_param_positions_wp: wp.array
     mu_feature_weights_wp: wp.array
     optimizer_params: wp.array
+    active_point_friction: wp.array | None
     full_point_friction: wp.array
     adam_m: wp.array
     adam_v: wp.array
@@ -228,6 +229,8 @@ class TrainableFriction:
     left_right_delta_sum_zero: bool
     min_value: float
     max_value: float
+    dino_mlp_model: object | None = None
+    dino_mlp_metadata: dict[str, np.ndarray] | None = None
 
 
 def parameterization_id(parameterization: str) -> int:
@@ -239,6 +242,8 @@ def parameterization_id(parameterization: str) -> int:
         return 2
     if parameterization == "base-delta":
         return 3
+    if parameterization == "dino-mlp":
+        return 4
     raise ValueError(f"Unsupported friction parameterization: {parameterization!r}")
 
 
@@ -264,35 +269,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-param-set", choices=("best", "current"), default="best")
     parser.add_argument("--experiment-dir", type=Path, default=REPO_ROOT / "outputs/residual_dynamics_adapter")
-    parser.add_argument(
-        "--timestamp-experiment-dir",
-        dest="timestamp_experiment_dir",
-        action="store_true",
-        default=True,
-        help="Prefix --experiment-dir's final directory name with the current local timestamp.",
-    )
-    parser.add_argument(
-        "--no-timestamp-experiment-dir",
-        dest="timestamp_experiment_dir",
-        action="store_false",
-        help="Keep --experiment-dir exactly as supplied.",
-    )
-    parser.add_argument(
-        "--experiment-dir-timestamp",
-        type=str,
-        default=None,
-        help="Override the timestamp prefix used when --timestamp-experiment-dir is enabled.",
-    )
     parser.add_argument("--max-trajectories", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--opt-iters", type=int, default=100)
     parser.add_argument(
         "--resume-adapter",
         type=Path,
         default=None,
-        help="Load a saved residual adapter checkpoint before training/evaluation.",
+        help="Load a saved residual adapter checkpoint before continuing training.",
     )
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--friction-learning-rate", type=float, default=None)
@@ -343,21 +328,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-window-source-max-steps", type=int, default=None)
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--val-fraction", type=float, default=0.05)
-    parser.add_argument("--eval-dataset", type=Path, action="append", default=[])
-    parser.add_argument("--eval-after-train", action="store_true")
-    parser.add_argument("--eval-trajectory-limit", type=int, default=None)
-    parser.add_argument(
-        "--eval-heldout-start",
-        type=int,
-        default=None,
-        help="Also evaluate each --eval-dataset subset from this trajectory index onward, e.g. 64 for rotation68.",
-    )
-    parser.add_argument(
-        "--eval-heldout-end",
-        type=int,
-        default=None,
-        help="Exclusive end index for --eval-heldout-start. Defaults to the dataset end.",
-    )
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", type=str, default="newton-contact-point-friction-fit")
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -374,12 +344,40 @@ def parse_args() -> argparse.Namespace:
         "--point-position-loss-reduction",
         choices=("sum", "mean"),
         default="mean",
-        help="Surface-point position loss reduction, matching friction fitting/eval semantics.",
+        help="Surface-point position loss reduction, matching friction fitting loss semantics.",
     )
     parser.add_argument("--residual-l2-weight", type=float, default=1.0e-4)
     parser.add_argument("--residual-smoothness-weight", type=float, default=1.0e-4)
+    parser.add_argument(
+        "--residual-output-mode",
+        choices=RESIDUAL_OUTPUT_MODES,
+        default="acceleration",
+        help=(
+            "Interpret the residual MLP output as either body-frame acceleration residuals "
+            "or body-frame velocity residuals. Existing checkpoints without this field are "
+            "treated as acceleration-mode checkpoints."
+        ),
+    )
     parser.add_argument("--acceleration-scale", type=float, default=2.0)
     parser.add_argument("--angular-acceleration-scale", type=float, default=20.0)
+    parser.add_argument(
+        "--velocity-scale",
+        type=float,
+        default=None,
+        help=(
+            "Linear residual output scale used when --residual-output-mode velocity. "
+            "Defaults to dt * --acceleration-scale."
+        ),
+    )
+    parser.add_argument(
+        "--angular-velocity-scale",
+        type=float,
+        default=None,
+        help=(
+            "Angular residual output scale used when --residual-output-mode velocity. "
+            "Defaults to dt * --angular-acceleration-scale."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=0, help="Filled after dataset loading.")
     parser.add_argument("--dt", type=float, default=0.0, help="Filled after dataset loading.")
     parser.add_argument("--solver-iterations", type=int, default=10)
@@ -392,9 +390,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-mask-threshold", type=float, default=0.002)
     parser.add_argument(
         "--friction-parameterization",
-        choices=("point", "left-right", "global", "base-delta"),
+        choices=("point", "left-right", "global", "base-delta", "dino-mlp"),
         default="point",
         help="Only used when --train-friction-end-to-end starts without --friction-checkpoint.",
+    )
+    parser.add_argument(
+        "--dino-feature-npz",
+        type=Path,
+        default=None,
+        help="NPZ from dino_point_features/run_block_force_dino_surface_points.py, required for dino-mlp friction.",
+    )
+    parser.add_argument("--dino-neighbor-radius", type=float, default=0.025)
+    parser.add_argument("--dino-neighbor-k", type=int, default=16)
+    parser.add_argument("--dino-position-frequencies", type=int, default=6)
+    parser.add_argument("--dino-mlp-hidden-dim", type=int, default=128)
+    parser.add_argument("--dino-mlp-hidden-layers", type=int, default=2)
+    parser.add_argument("--dino-mlp-max-match-distance", type=float, default=1.0e-5)
+    parser.add_argument(
+        "--no-dino-feature-normalization",
+        dest="dino_feature_normalization",
+        action="store_false",
+        default=True,
+        help="Disable per-dimension standardization of averaged DINO features before the friction MLP.",
     )
     parser.add_argument("--min-point-friction", type=float, default=0.0)
     parser.add_argument("--max-point-friction", type=float, default=2.0)
@@ -405,7 +422,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-margin", type=float, default=1.0e-3)
     parser.add_argument("--friction-regularization", type=float, default=1.0e-3)
     args = parser.parse_args()
-    _apply_experiment_dir_timestamp(args, parser)
+    args.residual_output_mode = normalize_residual_output_mode(args.residual_output_mode)
     return args
 
 
@@ -446,6 +463,50 @@ def _default_point_cloud_path_or_none(checkpoint_path: Path | None) -> Path | No
     if checkpoint_path is None:
         return None
     return _default_point_cloud_path(checkpoint_path)
+
+
+def _npz_scalar_or_none(data: np.lib.npyio.NpzFile, key: str) -> object | None:
+    if key not in data.files:
+        return None
+    value = np.asarray(data[key])
+    if value.shape == ():
+        return value.item()
+    return value
+
+
+def friction_parameterization_from_checkpoint(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    with np.load(path, allow_pickle=True) as data:
+        if "friction_parameterization" not in data.files:
+            return None
+        return str(np.asarray(data["friction_parameterization"]).item())
+
+
+def configure_dino_mlp_args_from_checkpoint(args: argparse.Namespace) -> str | None:
+    parameterization = friction_parameterization_from_checkpoint(args.friction_checkpoint)
+    if parameterization != "dino-mlp":
+        return parameterization
+
+    with np.load(args.friction_checkpoint, allow_pickle=True) as data:
+        dino_path = _npz_scalar_or_none(data, "dino_feature_npz_path")
+        if dino_path is not None:
+            args.dino_feature_npz = Path(str(dino_path))
+
+        scalar_fields = {
+            "dino_neighbor_radius": ("dino_neighbor_radius", float),
+            "dino_neighbor_k": ("dino_neighbor_k", int),
+            "dino_position_frequencies": ("dino_position_frequencies", int),
+            "dino_mlp_hidden_dim": ("dino_mlp_hidden_dim", int),
+            "dino_mlp_hidden_layers": ("dino_mlp_hidden_layers", int),
+            "dino_mlp_max_match_distance": ("dino_mlp_max_match_distance", float),
+            "dino_feature_normalization": ("dino_feature_normalization", bool),
+        }
+        for key, (attr, converter) in scalar_fields.items():
+            value = _npz_scalar_or_none(data, key)
+            if value is not None:
+                setattr(args, attr, converter(value))
+    return parameterization
 
 
 def _pad_vec3_rows(values: np.ndarray, length: int) -> np.ndarray:
@@ -582,6 +643,29 @@ def _xavier_uniform(rng: np.random.Generator, fan_in: int, fan_out: int) -> np.n
     return rng.uniform(-limit, limit, size=(fan_out, fan_in)).astype(np.float32)
 
 
+def resolve_residual_output_scales(args: argparse.Namespace) -> np.ndarray:
+    mode = normalize_residual_output_mode(getattr(args, "residual_output_mode", "acceleration"))
+    if mode == "velocity":
+        linear_scale = getattr(args, "velocity_scale", None)
+        angular_scale = getattr(args, "angular_velocity_scale", None)
+        if linear_scale is None:
+            linear_scale = float(getattr(args, "dt", 0.0)) * float(args.acceleration_scale)
+        if angular_scale is None:
+            angular_scale = float(getattr(args, "dt", 0.0)) * float(args.angular_acceleration_scale)
+        if float(linear_scale) <= 0.0:
+            raise ValueError("--velocity-scale must be positive, or dt * --acceleration-scale must be positive")
+        if float(angular_scale) <= 0.0:
+            raise ValueError(
+                "--angular-velocity-scale must be positive, or dt * --angular-acceleration-scale must be positive"
+            )
+        return np.asarray([float(linear_scale), float(linear_scale), float(angular_scale)], dtype=np.float32)
+
+    return np.asarray(
+        [float(args.acceleration_scale), float(args.acceleration_scale), float(args.angular_acceleration_scale)],
+        dtype=np.float32,
+    )
+
+
 def initialize_mlp_parameters(args: argparse.Namespace, device: str, rng: np.random.Generator) -> tuple[MLPParameters, MLPAdamState]:
     w0 = _xavier_uniform(rng, INPUT_DIM, HIDDEN0_DIM).reshape(-1)
     w1 = _xavier_uniform(rng, HIDDEN0_DIM, HIDDEN1_DIM).reshape(-1)
@@ -592,10 +676,7 @@ def initialize_mlp_parameters(args: argparse.Namespace, device: str, rng: np.ran
     b1 = np.zeros(HIDDEN1_DIM, dtype=np.float32)
     b2 = np.zeros(HIDDEN2_DIM, dtype=np.float32)
     b3 = np.zeros(OUTPUT_DIM, dtype=np.float32)
-    output_scales = np.asarray(
-        [float(args.acceleration_scale), float(args.acceleration_scale), float(args.angular_acceleration_scale)],
-        dtype=np.float32,
-    )
+    output_scales = resolve_residual_output_scales(args)
 
     params = MLPParameters(
         w0=wp.array(w0, dtype=wp.float32, device=device, requires_grad=True),
@@ -676,6 +757,12 @@ def clear_gradients(
             array.grad.zero_()
     if trainable_friction is not None and trainable_friction.optimizer_params.grad is not None:
         trainable_friction.optimizer_params.grad.zero_()
+    if trainable_friction is not None and trainable_friction.dino_mlp_model is not None:
+        trainable_friction.dino_mlp_model.zero_grad()
+    if trainable_friction is not None and trainable_friction.active_point_friction is not None:
+        trainable_friction.active_point_friction.zero_()
+        if trainable_friction.active_point_friction.grad is not None:
+            trainable_friction.active_point_friction.grad.zero_()
     if trainable_friction is not None and trainable_friction.full_point_friction.grad is not None:
         trainable_friction.full_point_friction.grad.zero_()
     if trainable_friction is not None and trainable_friction.mu_features_wp.grad is not None:
@@ -805,6 +892,10 @@ def initialize_active_friction_from_parameterization(
     args: argparse.Namespace,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     parameterization = validate_friction_parameterization(str(args.friction_parameterization))
+    if parameterization == "dino-mlp":
+        active_param_positions = np.arange(len(active_indices), dtype=np.int32)
+        active_params = np.full(len(active_indices), float(args.point_friction), dtype=np.float32)
+        return active_params, np.zeros(0, dtype=np.float32), active_param_positions, parameterization
     active_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
     active_param_positions, optimizer_param_count = build_optimizer_param_positions(
         parameterization=parameterization,
@@ -837,6 +928,8 @@ def infer_optimizer_params_from_active(
     active_params: np.ndarray,
     parameterization: str,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if parameterization == "dino-mlp":
+        raise ValueError("Cannot infer DINO-MLP optimizer parameters from active friction values alone.")
     active_side_ids = compute_piecewise_side_ids(diff_scene.local_surface_points_np, active_indices)
     active_param_positions, optimizer_param_count = build_optimizer_param_positions(
         parameterization=parameterization,
@@ -1044,32 +1137,8 @@ def forward_residual_rollout(
     activations.residuals.zero_()
 
     if trainable_friction is not None:
-        trainable_friction.mu_features_wp.zero_()
-        wp.launch(
-            accumulate_optimizer_mu_features_kernel,
-            dim=int(trainable_friction.active_indices_wp.shape[0]),
-            inputs=[
-                trainable_friction.active_param_positions_wp,
-                trainable_friction.optimizer_params,
-                int(trainable_friction.parameterization_id),
-                trainable_friction.mu_feature_weights_wp,
-                trainable_friction.mu_features_wp,
-            ],
-            device=diff_scene.model.device,
-        )
+        refresh_trainable_friction_device_state(trainable_friction)
         mu_features = trainable_friction.mu_features_wp
-        wp.launch(
-            scatter_optimizer_point_friction_kernel,
-            dim=int(trainable_friction.active_indices_wp.shape[0]),
-            inputs=[
-                trainable_friction.active_indices_wp,
-                trainable_friction.active_param_positions_wp,
-                trainable_friction.optimizer_params,
-                int(trainable_friction.parameterization_id),
-                trainable_friction.full_point_friction,
-            ],
-            device=diff_scene.model.device,
-        )
         point_friction = trainable_friction.full_point_friction
     else:
         point_friction = buffers.full_point_friction
@@ -1249,6 +1318,7 @@ def forward_residual_rollout(
                 activations.residuals,
                 buffers.trajectory_step_counts,
                 batch_size,
+                residual_output_mode_id(getattr(args, "residual_output_mode", "acceleration")),
                 float(args.dt),
                 state_out.body_q,
                 state_out.body_qd,
@@ -1481,6 +1551,10 @@ def run_truncated_bptt_segments(
 
 
 def expand_trainable_friction_to_active_np(trainable_friction: TrainableFriction) -> np.ndarray:
+    if trainable_friction.parameterization == "dino-mlp":
+        if trainable_friction.dino_mlp_model is None:
+            raise RuntimeError("DINO-MLP trainable friction is missing its model.")
+        return trainable_friction.dino_mlp_model.predict_np(trainable_friction.active_indices_np)
     optimizer_params = np.asarray(trainable_friction.optimizer_params.numpy(), dtype=np.float32)
     return expand_optimizer_params_to_active(
         optimizer_params,
@@ -1554,6 +1628,8 @@ def adam_update_array(
 
 
 def clip_friction_params(trainable_friction: TrainableFriction) -> None:
+    if trainable_friction.parameterization == "dino-mlp":
+        return
     if trainable_friction.parameterization == "base-delta":
         wp.launch(
             project_base_delta_optimizer_params_kernel,
@@ -1592,6 +1668,38 @@ def refresh_trainable_friction_features(diff_scene, trainable_friction: Trainabl
 
 
 def refresh_trainable_friction_device_state(trainable_friction: TrainableFriction) -> None:
+    if trainable_friction.parameterization == "dino-mlp":
+        if trainable_friction.dino_mlp_model is None or trainable_friction.active_point_friction is None:
+            raise RuntimeError("DINO-MLP trainable friction is missing its model or active output buffer.")
+        trainable_friction.mu_features_wp.zero_()
+        trainable_friction.active_point_friction.zero_()
+        trainable_friction.dino_mlp_model.forward_active(
+            trainable_friction.active_indices_wp,
+            int(trainable_friction.active_indices_wp.shape[0]),
+            trainable_friction.active_point_friction,
+        )
+        wp.launch(
+            accumulate_active_mu_features_kernel,
+            dim=int(trainable_friction.active_indices_wp.shape[0]),
+            inputs=[
+                trainable_friction.active_point_friction,
+                trainable_friction.mu_feature_weights_wp,
+                trainable_friction.mu_features_wp,
+            ],
+            device=trainable_friction.optimizer_params.device,
+        )
+        wp.launch(
+            scatter_active_point_friction_kernel,
+            dim=int(trainable_friction.active_indices_wp.shape[0]),
+            inputs=[
+                trainable_friction.active_indices_wp,
+                trainable_friction.active_point_friction,
+                trainable_friction.full_point_friction,
+            ],
+            device=trainable_friction.optimizer_params.device,
+        )
+        return
+
     trainable_friction.mu_features_wp.zero_()
     wp.launch(
         accumulate_optimizer_mu_features_kernel,
@@ -1687,6 +1795,7 @@ def save_adapter_checkpoint(
         "full_point_friction": full_point_friction,
         "train_friction_end_to_end": np.asarray(trainable_friction is not None),
         "friction_adam_step": np.asarray(0 if trainable_friction is None else trainable_friction.step, dtype=np.int32),
+        "residual_output_mode": np.asarray(normalize_residual_output_mode(getattr(args, "residual_output_mode", "acceleration"))),
         "loss_history": np.asarray(loss_history, dtype=np.float32),
         "checkpoint_kind": np.asarray(str(checkpoint_kind)),
         "checkpoint_loss": np.asarray(
@@ -1714,6 +1823,20 @@ def save_adapter_checkpoint(
         arrays["friction_adam_v"] = trainable_friction.adam_v.numpy()
         arrays["friction_optimizer_params"] = trainable_friction.optimizer_params.numpy()
         arrays["friction_active_param_positions"] = trainable_friction.active_param_positions_np
+        if trainable_friction.parameterization == "dino-mlp" and trainable_friction.dino_mlp_model is not None:
+            all_surface_indices = np.arange(len(full_point_friction), dtype=np.int32)
+            arrays["friction_adam_step_array"] = trainable_friction.dino_mlp_model.adam_step.numpy().astype(np.int32)
+            arrays["dino_feature_npz_path"] = np.asarray(str(args.dino_feature_npz))
+            arrays["dino_neighbor_radius"] = np.asarray(float(args.dino_neighbor_radius), dtype=np.float32)
+            arrays["dino_neighbor_k"] = np.asarray(int(args.dino_neighbor_k), dtype=np.int32)
+            arrays["dino_position_frequencies"] = np.asarray(int(args.dino_position_frequencies), dtype=np.int32)
+            arrays["dino_mlp_hidden_dim"] = np.asarray(int(args.dino_mlp_hidden_dim), dtype=np.int32)
+            arrays["dino_mlp_hidden_layers"] = np.asarray(int(args.dino_mlp_hidden_layers), dtype=np.int32)
+            arrays["dino_feature_normalization"] = np.asarray(bool(args.dino_feature_normalization))
+            arrays["dino_mlp_all_point_friction"] = trainable_friction.dino_mlp_model.predict_np(all_surface_indices)
+            arrays["dino_mlp_max_match_distance"] = np.asarray(float(args.dino_mlp_max_match_distance), dtype=np.float32)
+            for key, value in (trainable_friction.dino_mlp_metadata or {}).items():
+                arrays[f"dino_mlp_{key}"] = np.asarray(value)
     np.savez_compressed(path, **arrays)
 
 
@@ -1797,6 +1920,8 @@ def load_trainable_friction_checkpoint(path: Path, trainable_friction: Trainable
                 )
             trainable_friction.optimizer_params.assign(values)
         elif "active_params" in data.files:
+            if trainable_friction.parameterization == "dino-mlp":
+                raise ValueError(f"{path} is missing friction_optimizer_params for DINO-MLP resume.")
             optimizer_params, _ = infer_optimizer_params_from_active(
                 diff_scene=diff_scene,
                 active_indices=trainable_friction.active_indices_np,
@@ -1815,14 +1940,138 @@ def load_trainable_friction_checkpoint(path: Path, trainable_friction: Trainable
             v = np.asarray(data["friction_adam_v"], dtype=np.float64)
             if v.shape == trainable_friction.adam_v.numpy().shape:
                 trainable_friction.adam_v.assign(v)
+        if trainable_friction.parameterization == "dino-mlp" and trainable_friction.dino_mlp_model is not None:
+            if "friction_adam_step_array" in data.files:
+                step_array = np.asarray(data["friction_adam_step_array"], dtype=np.int32)
+                if step_array.shape == trainable_friction.dino_mlp_model.adam_step.numpy().shape:
+                    trainable_friction.dino_mlp_model.adam_step.assign(step_array)
+                    trainable_friction.step = int(np.max(step_array)) if step_array.size else 0
+            elif "friction_adam_step" in data.files:
+                step_value = int(np.asarray(data["friction_adam_step"]).item())
+                trainable_friction.dino_mlp_model.adam_step.assign(
+                    np.full(trainable_friction.optimizer_params.shape[0], step_value, dtype=np.int32)
+                )
+                trainable_friction.step = step_value
         if "friction_adam_step" in data.files:
             trainable_friction.step = int(np.asarray(data["friction_adam_step"]).item())
         clip_friction_params(trainable_friction)
 
 
+def _checkpoint_optimizer_params_for_trainable_dino(args: argparse.Namespace) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    if args.friction_checkpoint is None:
+        return None, None, None, None
+    with np.load(args.friction_checkpoint, allow_pickle=True) as data:
+        param_key = "best_optimizer_params" if args.checkpoint_param_set == "best" else "optimizer_params"
+        if param_key not in data.files and "optimizer_params" in data.files:
+            param_key = "optimizer_params"
+        if param_key not in data.files:
+            return None, None, None, None
+        optimizer_params = np.asarray(data[param_key], dtype=np.float32)
+        if args.checkpoint_param_set == "current":
+            adam_m = np.asarray(data["adam_m"], dtype=np.float64) if "adam_m" in data.files else None
+            adam_v = np.asarray(data["adam_v"], dtype=np.float64) if "adam_v" in data.files else None
+            adam_step = np.asarray(data["adam_step"], dtype=np.int32) if "adam_step" in data.files else None
+        else:
+            adam_m = None
+            adam_v = None
+            adam_step = None
+        return optimizer_params, adam_m, adam_v, adam_step
+
+
+def build_dino_mlp_trainable_friction(
+    frozen: FrozenFriction,
+    diff_scene,
+    args: argparse.Namespace,
+    device: str,
+) -> TrainableFriction:
+    if args.dino_feature_npz is None:
+        raise ValueError("--dino-feature-npz is required for end-to-end dino-mlp friction.")
+
+    active_indices = np.asarray(frozen.active_indices, dtype=np.int32)
+    dino_model, dino_metadata = build_warp_dino_mlp_friction_model(
+        dino_npz_path=args.dino_feature_npz,
+        local_surface_points=diff_scene.local_surface_points_np,
+        half_extents=np.asarray(args.box_half_extents, dtype=np.float32),
+        active_capacity=len(active_indices),
+        hidden_dim=int(args.dino_mlp_hidden_dim),
+        hidden_layers=int(args.dino_mlp_hidden_layers),
+        initial_mu=float(np.mean(frozen.active_params)) if len(frozen.active_params) else float(args.point_friction),
+        min_mu=float(args.min_point_friction),
+        max_mu=float(args.max_point_friction),
+        seed=int(args.seed),
+        device=device,
+        position_frequencies=int(args.dino_position_frequencies),
+        neighbor_radius=float(args.dino_neighbor_radius),
+        neighbor_k=int(args.dino_neighbor_k),
+        normalize_dino=bool(args.dino_feature_normalization),
+        max_match_distance=float(args.dino_mlp_max_match_distance),
+    )
+    optimizer_params, adam_m, adam_v, adam_step = _checkpoint_optimizer_params_for_trainable_dino(args)
+    if optimizer_params is not None:
+        if optimizer_params.shape != dino_model.params_numpy().shape:
+            raise ValueError(
+                f"DINO-MLP checkpoint optimizer shape {optimizer_params.shape} does not match "
+                f"current model shape {dino_model.params_numpy().shape}. Check DINO MLP architecture args."
+            )
+        dino_model.assign_params(optimizer_params)
+    if adam_m is not None and adam_v is not None and adam_step is not None:
+        if (
+            adam_m.shape == dino_model.first_moment.numpy().shape
+            and adam_v.shape == dino_model.second_moment.numpy().shape
+            and adam_step.shape == dino_model.adam_step.numpy().shape
+        ):
+            dino_model.assign_moments(adam_m, adam_v, adam_step)
+
+    active_params = dino_model.predict_np(active_indices)
+    full_point_friction = np.full(len(diff_scene.local_surface_points_np), float(args.point_friction), dtype=np.float32)
+    full_point_friction[active_indices] = active_params
+    mu_features = compute_mu_features_from_active(diff_scene, active_indices, active_params, "dino-mlp")
+    frozen.active_params = active_params
+    frozen.full_point_friction = full_point_friction
+    frozen.mu_features = mu_features
+
+    active_param_positions = np.arange(len(active_indices), dtype=np.int32)
+    active_point_friction = wp.zeros(len(active_indices), dtype=wp.float32, device=device, requires_grad=True)
+    active_point_friction.grad = wp.zeros_like(active_point_friction)
+    full_point_friction_wp = wp.array(full_point_friction, dtype=wp.float32, device=device, requires_grad=True)
+    full_point_friction_wp.grad = wp.zeros_like(full_point_friction_wp)
+    mu_features_wp = wp.array(mu_features, dtype=wp.float32, device=device, requires_grad=True)
+    mu_features_wp.grad = wp.zeros_like(mu_features_wp)
+    adam_step_np = dino_model.adam_step.numpy().astype(np.int32)
+    return TrainableFriction(
+        mode="end_to_end",
+        active_indices_np=active_indices,
+        active_indices_wp=wp.array(active_indices, dtype=wp.int32, device=device),
+        active_param_positions_np=active_param_positions,
+        active_param_positions_wp=wp.array(active_param_positions, dtype=wp.int32, device=device),
+        mu_feature_weights_wp=wp.array(
+            build_mu_feature_weights(diff_scene, active_indices),
+            dtype=wp.float32,
+            device=device,
+        ),
+        optimizer_params=dino_model.params,
+        active_point_friction=active_point_friction,
+        full_point_friction=full_point_friction_wp,
+        adam_m=dino_model.first_moment,
+        adam_v=dino_model.second_moment,
+        mu_features_np=mu_features,
+        mu_features_wp=mu_features_wp,
+        step=int(np.max(adam_step_np)) if adam_step_np.size else 0,
+        parameterization="dino-mlp",
+        parameterization_id=parameterization_id("dino-mlp"),
+        left_right_delta_sum_zero=False,
+        min_value=float(args.min_point_friction),
+        max_value=float(args.max_point_friction),
+        dino_mlp_model=dino_model,
+        dino_mlp_metadata=dino_metadata,
+    )
+
+
 def build_trainable_friction(frozen: FrozenFriction, diff_scene, args: argparse.Namespace, device: str) -> TrainableFriction | None:
     if not bool(args.train_friction_end_to_end):
         return None
+    if frozen.parameterization == "dino-mlp":
+        return build_dino_mlp_trainable_friction(frozen, diff_scene, args, device)
     optimizer_params, active_param_positions = infer_optimizer_params_from_active(
         diff_scene=diff_scene,
         active_indices=np.asarray(frozen.active_indices, dtype=np.int32),
@@ -1859,6 +2108,7 @@ def build_trainable_friction(frozen: FrozenFriction, diff_scene, args: argparse.
             device=device,
         ),
         optimizer_params=optimizer_wp,
+        active_point_friction=None,
         full_point_friction=full_point_friction,
         adam_m=wp.array(zeros, dtype=wp.float64, device=device),
         adam_v=wp.array(zeros, dtype=wp.float64, device=device),
@@ -1887,119 +2137,22 @@ def _jsonable_args(args: argparse.Namespace) -> dict:
     return result
 
 
-def evaluate_trajectories(
-    *,
-    name: str,
-    trajectories: list[MujocoTrajectory],
-    diff_scene,
-    sim_states,
-    params: MLPParameters,
-    frozen: FrozenFriction,
-    feature_mean_wp: wp.array,
-    feature_inv_std_wp: wp.array,
-    mu_features_wp: wp.array,
-    trainable_friction: TrainableFriction | None,
-    initial_body_q: np.ndarray,
-    initial_body_qd: np.ndarray,
-    args: argparse.Namespace,
-    batch_size: int,
-) -> dict:
-    if not trajectories:
-        return {
-            "name": name,
-            "count": 0,
-            "mean_loss": float("nan"),
-            "median_loss": float("nan"),
-        }
-    if args.eval_trajectory_limit is not None:
-        trajectories = trajectories[: max(int(args.eval_trajectory_limit), 0)]
-    trajectories = [
-        slice_mujoco_trajectory_time_window(trajectory, start_step=0, window_steps=int(args.steps))
-        if trajectory.num_steps > int(args.steps)
-        else trajectory
-        for trajectory in trajectories
-    ]
-    device = str(diff_scene.torch_device)
-    all_loss: list[np.ndarray] = []
-    all_position_loss: list[np.ndarray] = []
-    all_orientation_loss: list[np.ndarray] = []
-    all_linear_velocity_loss: list[np.ndarray] = []
-    all_angular_velocity_loss: list[np.ndarray] = []
-    all_residual_norm: list[np.ndarray] = []
-    all_residual_energy: list[np.ndarray] = []
-    all_residual_max: list[np.ndarray] = []
-    eval_buffers = build_rollout_buffers(
-        device=device,
-        point_count=len(diff_scene.local_surface_points_np),
-        full_point_friction=frozen.full_point_friction,
-        batch_capacity=min(max(int(batch_size), 1), max(len(trajectories), 1)),
-        step_capacity=int(args.steps),
-    )
-    eval_activations = build_activation_buffers(
-        device=device,
-        batch_capacity=eval_buffers.batch_capacity,
-        step_capacity=eval_buffers.step_capacity,
-    )
-
-    for batch_start in range(0, len(trajectories), batch_size):
-        batch_trajectories = trajectories[batch_start : batch_start + batch_size]
-        active_batch_size = assign_rollout_buffer_trajectories(eval_buffers, batch_trajectories)
-        clear_gradients(params, eval_activations, eval_buffers, trainable_friction=trainable_friction)
-        reset_scene_states(diff_scene, initial_body_q, initial_body_qd)
-        forward_residual_rollout(
-            diff_scene=diff_scene,
-            sim_states=sim_states,
-            buffers=eval_buffers,
-            activations=eval_activations,
-            batch_size=active_batch_size,
-            params=params,
-            feature_mean=feature_mean_wp,
-            feature_inv_std=feature_inv_std_wp,
-            mu_features=mu_features_wp,
-            trainable_friction=trainable_friction,
-            args=args,
-        )
-        all_loss.append(eval_buffers.loss.numpy()[:active_batch_size].copy())
-        all_position_loss.append(eval_buffers.position_loss.numpy()[:active_batch_size].copy())
-        all_orientation_loss.append(eval_buffers.orientation_loss.numpy()[:active_batch_size].copy())
-        all_linear_velocity_loss.append(eval_buffers.linear_velocity_loss.numpy()[:active_batch_size].copy())
-        all_angular_velocity_loss.append(eval_buffers.angular_velocity_loss.numpy()[:active_batch_size].copy())
-        all_residual_norm.append(eval_buffers.residual_norm_mean.numpy()[:active_batch_size].copy())
-        all_residual_energy.append(eval_buffers.residual_energy_mean.numpy()[:active_batch_size].copy())
-        all_residual_max.append(eval_buffers.residual_norm_max.numpy()[:active_batch_size].copy())
-
-    losses = np.concatenate(all_loss)
-    result = {
-        "name": name,
-        "count": int(len(losses)),
-        "mean_loss": float(np.mean(losses)),
-        "median_loss": float(np.median(losses)),
-        "mean_position_loss": float(np.mean(np.concatenate(all_position_loss))),
-        "mean_orientation_loss": float(np.mean(np.concatenate(all_orientation_loss))),
-        "mean_linear_velocity_loss": float(np.mean(np.concatenate(all_linear_velocity_loss))),
-        "mean_angular_velocity_loss": float(np.mean(np.concatenate(all_angular_velocity_loss))),
-        "mean_residual_norm": float(np.mean(np.concatenate(all_residual_norm))),
-        "mean_residual_energy": float(np.mean(np.concatenate(all_residual_energy))),
-        "max_residual_norm": float(np.max(np.concatenate(all_residual_max))),
-    }
-    log_message(
-        f"eval {name}: count={result['count']} mean_loss={result['mean_loss']:.6g} "
-        f"median_loss={result['median_loss']:.6g} mean_residual_norm={result['mean_residual_norm']:.6g} "
-        f"max_residual_norm={result['max_residual_norm']:.6g}"
-    )
-    return result
-
-
 def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive for residual closed-loop training.")
-    if args.eval_batch_size <= 0:
-        raise ValueError("--eval-batch-size must be positive.")
     if args.friction_checkpoint is None and not bool(args.train_friction_end_to_end):
         raise ValueError("--friction-checkpoint is required unless --train-friction-end-to-end is set.")
     if float(args.max_point_friction) < float(args.min_point_friction):
         raise ValueError("--max-point-friction must be >= --min-point-friction.")
+    checkpoint_parameterization = configure_dino_mlp_args_from_checkpoint(args)
+    requested_parameterization = (
+        checkpoint_parameterization
+        if args.friction_checkpoint is not None and checkpoint_parameterization is not None
+        else validate_friction_parameterization(str(args.friction_parameterization))
+    )
+    if bool(args.train_friction_end_to_end) and requested_parameterization == "dino-mlp" and args.dino_feature_npz is None:
+        raise ValueError("--dino-feature-npz is required for end-to-end dino-mlp friction.")
 
     rng = np.random.default_rng(int(args.seed))
     maybe_infer_scene_from_point_cloud(args)
@@ -2019,12 +2172,17 @@ def main() -> None:
     )
     args.steps = _resolve_window_steps(args, collection.max_steps)
     args.dt = float(trajectories[0].timestep)
-    args.batch_capacity = max(int(args.batch_size), int(args.eval_batch_size), 1)
+    args.batch_capacity = max(int(args.batch_size), 1)
 
     log_message(
         f"split trajectories train={len(train_trajectories)} val={len(val_trajectories)} "
         f"test_lite={len(test_trajectories)} source_max_steps={collection.max_steps} "
         f"rollout_steps={args.steps} random_time_windows={int(args.random_time_windows)} dt={args.dt:.6f}"
+    )
+    output_scales_preview = resolve_residual_output_scales(args)
+    log_message(
+        f"residual_output_mode={args.residual_output_mode} "
+        f"output_scales={output_scales_preview.tolist()}"
     )
 
     log_message(f"building Newton scene on device={args.device if args.device is not None else 'auto'}")
@@ -2057,14 +2215,29 @@ def main() -> None:
     if trainable_friction is not None:
         log_message(
             f"end_to_end_friction=1 active_points={len(trainable_friction.active_indices_np)} "
+            f"parameterization={trainable_friction.parameterization} "
+            f"optimizer_params={int(trainable_friction.optimizer_params.shape[0])} "
             f"friction_lr={float(args.friction_learning_rate if args.friction_learning_rate is not None else args.learning_rate):.3g} "
             f"friction_clip=[{float(args.min_point_friction):.3g}, {float(args.max_point_friction):.3g}]"
         )
+        if trainable_friction.parameterization == "dino-mlp":
+            log_message(
+                f"dino_mlp input_dim={int((trainable_friction.dino_mlp_metadata or {})['input_dim'])} "
+                f"hidden_layers={int(args.dino_mlp_hidden_layers)} hidden_dim={int(args.dino_mlp_hidden_dim)} "
+                f"feature_npz={args.dino_feature_npz}"
+            )
     else:
         log_message("end_to_end_friction=0 frozen friction parameters")
     loss_history: list[float] = []
     start_iteration = 1
     if args.resume_adapter is not None:
+        checkpoint_output_mode = residual_output_mode_from_checkpoint(args.resume_adapter)
+        if checkpoint_output_mode != args.residual_output_mode:
+            raise ValueError(
+                f"--resume-adapter was trained with residual_output_mode={checkpoint_output_mode!r}, "
+                f"but the current run requested {args.residual_output_mode!r}. Start a fresh run or "
+                "resume with the same --residual-output-mode."
+            )
         resume_iteration, feature_mean, feature_std, loss_history = load_adapter_checkpoint(args.resume_adapter, params, adam)
         load_trainable_friction_checkpoint(args.resume_adapter, trainable_friction, diff_scene)
         if trainable_friction is not None:
@@ -2092,7 +2265,6 @@ def main() -> None:
 
     checkpoint_path = args.experiment_dir / f"{args.experiment_dir.name}.npz"
     best_checkpoint_path = args.experiment_dir / f"{args.experiment_dir.name}_best.npz"
-    metrics_path = args.experiment_dir / f"{args.experiment_dir.name}_metrics.json"
 
     training_start = time.time()
     log_message(
@@ -2303,20 +2475,36 @@ def main() -> None:
                 friction_clipped_grad_norm = grad_clip_norm
             else:
                 friction_grad_scale = 1.0
-            adam_update_array(
-                params=trainable_friction.optimizer_params,
-                first_moment=trainable_friction.adam_m,
-                second_moment=trainable_friction.adam_v,
-                step=trainable_friction.step,
-                learning_rate=friction_lr,
-                beta1=float(args.adam_beta1),
-                beta2=float(args.adam_beta2),
-                eps=float(args.adam_eps),
-                grad_scale=friction_grad_scale,
-                device=device,
-            )
-            clip_friction_params(trainable_friction)
+            if trainable_friction.parameterization == "dino-mlp":
+                if trainable_friction.dino_mlp_model is None:
+                    raise RuntimeError("DINO-MLP trainable friction is missing its model.")
+                trainable_friction.dino_mlp_model.adam_step_update(
+                    grad_scale=friction_grad_scale,
+                    learning_rate=friction_lr,
+                    beta1=float(args.adam_beta1),
+                    beta2=float(args.adam_beta2),
+                    eps=float(args.adam_eps),
+                )
+            else:
+                adam_update_array(
+                    params=trainable_friction.optimizer_params,
+                    first_moment=trainable_friction.adam_m,
+                    second_moment=trainable_friction.adam_v,
+                    step=trainable_friction.step,
+                    learning_rate=friction_lr,
+                    beta1=float(args.adam_beta1),
+                    beta2=float(args.adam_beta2),
+                    eps=float(args.adam_eps),
+                    grad_scale=friction_grad_scale,
+                    device=device,
+                )
+                clip_friction_params(trainable_friction)
             refresh_trainable_friction_device_state(trainable_friction)
+            assert_array_finite(
+                "friction_optimizer_params",
+                np.asarray(trainable_friction.optimizer_params.numpy(), dtype=np.float32),
+                context=f"iter={iteration:04d} friction update",
+            )
 
         if trainable_friction is not None:
             frozen.mu_features = np.asarray(trainable_friction.mu_features_wp.numpy(), dtype=np.float32)
@@ -2434,116 +2622,6 @@ def main() -> None:
         f"skipped_nonfinite_batches={skipped_nonfinite_batches}"
     )
 
-    eval_results = []
-    if args.eval_after_train:
-        eval_results.append(
-            evaluate_trajectories(
-                name="residual_train_split",
-                trajectories=train_trajectories,
-                diff_scene=diff_scene,
-                sim_states=sim_states,
-                params=params,
-                frozen=frozen,
-                feature_mean_wp=feature_mean_wp,
-                feature_inv_std_wp=feature_inv_std_wp,
-                mu_features_wp=mu_features_wp,
-                trainable_friction=trainable_friction,
-                initial_body_q=initial_body_q,
-                initial_body_qd=initial_body_qd,
-                args=args,
-                batch_size=int(args.eval_batch_size),
-            )
-        )
-        eval_results.append(
-            evaluate_trajectories(
-                name="residual_val_split",
-                trajectories=val_trajectories,
-                diff_scene=diff_scene,
-                sim_states=sim_states,
-                params=params,
-                frozen=frozen,
-                feature_mean_wp=feature_mean_wp,
-                feature_inv_std_wp=feature_inv_std_wp,
-                mu_features_wp=mu_features_wp,
-                trainable_friction=trainable_friction,
-                initial_body_q=initial_body_q,
-                initial_body_qd=initial_body_qd,
-                args=args,
-                batch_size=int(args.eval_batch_size),
-            )
-        )
-        eval_results.append(
-            evaluate_trajectories(
-                name="residual_test_lite_split",
-                trajectories=test_trajectories,
-                diff_scene=diff_scene,
-                sim_states=sim_states,
-                params=params,
-                frozen=frozen,
-                feature_mean_wp=feature_mean_wp,
-                feature_inv_std_wp=feature_inv_std_wp,
-                mu_features_wp=mu_features_wp,
-                trainable_friction=trainable_friction,
-                initial_body_q=initial_body_q,
-                initial_body_qd=initial_body_qd,
-                args=args,
-                batch_size=int(args.eval_batch_size),
-            )
-        )
-
-    for eval_dataset in args.eval_dataset:
-        eval_collection = load_mujoco_trajectories(eval_dataset, args.steps, None)
-        eval_results.append(
-            evaluate_trajectories(
-                name=eval_dataset.stem,
-                trajectories=eval_collection.trajectories,
-                diff_scene=diff_scene,
-                sim_states=sim_states,
-                params=params,
-                frozen=frozen,
-                feature_mean_wp=feature_mean_wp,
-                feature_inv_std_wp=feature_inv_std_wp,
-                mu_features_wp=mu_features_wp,
-                trainable_friction=trainable_friction,
-                initial_body_q=initial_body_q,
-                initial_body_qd=initial_body_qd,
-                args=args,
-                batch_size=int(args.eval_batch_size),
-            )
-        )
-        if args.eval_heldout_start is not None:
-            heldout_start = max(int(args.eval_heldout_start), 0)
-            heldout_end = (
-                len(eval_collection.trajectories)
-                if args.eval_heldout_end is None
-                else min(int(args.eval_heldout_end), len(eval_collection.trajectories))
-            )
-            if heldout_start < heldout_end:
-                eval_results.append(
-                    evaluate_trajectories(
-                        name=f"{eval_dataset.stem}_heldout_{heldout_start}_{heldout_end}",
-                        trajectories=eval_collection.trajectories[heldout_start:heldout_end],
-                        diff_scene=diff_scene,
-                        sim_states=sim_states,
-                        params=params,
-                        frozen=frozen,
-                        feature_mean_wp=feature_mean_wp,
-                        feature_inv_std_wp=feature_inv_std_wp,
-                        mu_features_wp=mu_features_wp,
-                        trainable_friction=trainable_friction,
-                        initial_body_q=initial_body_q,
-                        initial_body_qd=initial_body_qd,
-                        args=args,
-                        batch_size=int(args.eval_batch_size),
-                    )
-                )
-
-    if eval_results:
-        metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        with metrics_path.open("w", encoding="utf-8") as f:
-            json.dump({"eval": eval_results}, f, indent=2, sort_keys=True)
-        log_message(f"metrics written to {metrics_path.resolve()}")
-
     if int(args.opt_iters) == 0 or not checkpoint_path.exists():
         save_adapter_checkpoint(
             path=checkpoint_path,
@@ -2580,8 +2658,6 @@ def main() -> None:
         wandb_run.summary["checkpoint_path"] = str(checkpoint_path.resolve())
         if best_checkpoint_path.exists():
             wandb_run.summary["best_checkpoint_path"] = str(best_checkpoint_path.resolve())
-        if metrics_path.exists():
-            wandb_run.summary["metrics_path"] = str(metrics_path.resolve())
         wandb_run.finish()
 
 

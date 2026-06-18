@@ -8,6 +8,8 @@ HIDDEN0_DIM = 128
 HIDDEN1_DIM = 128
 HIDDEN2_DIM = 64
 OUTPUT_DIM = 3
+RESIDUAL_OUTPUT_MODE_ACCELERATION = 0
+RESIDUAL_OUTPUT_MODE_VELOCITY = 1
 
 
 @wp.func
@@ -167,6 +169,20 @@ def project_base_delta_optimizer_params_kernel(
     optimizer_params[0] = base
     optimizer_params[1] = mu_left - base
     optimizer_params[2] = mu_right - base
+
+
+@wp.kernel
+def accumulate_active_mu_features_kernel(
+    active_point_friction: wp.array(dtype=float),
+    mu_feature_weights: wp.array(dtype=float),
+    mu_features: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    mu = active_point_friction[tid]
+    weight_base = tid * 3
+    wp.atomic_add(mu_features, 0, mu_feature_weights[weight_base + 0] * mu)
+    wp.atomic_add(mu_features, 1, mu_feature_weights[weight_base + 1] * mu)
+    wp.atomic_add(mu_features, 2, mu_feature_weights[weight_base + 2] * mu)
 
 
 @wp.kernel
@@ -337,6 +353,7 @@ def apply_residual_planar_dynamics_kernel(
     residuals: wp.array(dtype=float),
     trajectory_step_counts: wp.array(dtype=wp.int32),
     batch_size: int,
+    residual_output_mode: int,
     dt: float,
     pred_body_q: wp.array(dtype=wp.transform),
     pred_body_qd: wp.array(dtype=wp.spatial_vector),
@@ -353,43 +370,48 @@ def apply_residual_planar_dynamics_kernel(
         return
 
     residual_base = (step_idx * batch_size + batch_idx) * OUTPUT_DIM
-    delta_a_body_x = residuals[residual_base + 0]
-    delta_a_body_y = residuals[residual_base + 1]
-    delta_alpha_z = residuals[residual_base + 2]
+    delta_body_x = residuals[residual_base + 0]
+    delta_body_y = residuals[residual_base + 1]
+    delta_z = residuals[residual_base + 2]
 
     current_pose = current_body_q[body_id]
     current_yaw = _quat_yaw_xyzw(wp.transform_get_rotation(current_pose))
     c = wp.cos(current_yaw)
     s = wp.sin(current_yaw)
-    delta_a_world_x = c * delta_a_body_x - s * delta_a_body_y
-    delta_a_world_y = s * delta_a_body_x + c * delta_a_body_y
+    delta_world_x = c * delta_body_x - s * delta_body_y
+    delta_world_y = s * delta_body_x + c * delta_body_y
 
     sim_pos = wp.transform_get_translation(sim_pose)
     sim_quat = wp.transform_get_rotation(sim_pose)
     sim_linear_velocity = wp.spatial_top(sim_qd)
     sim_angular_velocity = wp.spatial_bottom(sim_qd)
 
-    dt2_half = 0.5 * dt * dt
+    position_scale = dt
+    velocity_scale = 1.0
+    if residual_output_mode == RESIDUAL_OUTPUT_MODE_ACCELERATION:
+        position_scale = 0.5 * dt * dt
+        velocity_scale = dt
+
     pred_pos = wp.vec3(
-        sim_pos[0] + dt2_half * delta_a_world_x,
-        sim_pos[1] + dt2_half * delta_a_world_y,
+        sim_pos[0] + position_scale * delta_world_x,
+        sim_pos[1] + position_scale * delta_world_y,
         sim_pos[2],
     )
 
-    yaw_delta = dt2_half * delta_alpha_z
+    yaw_delta = position_scale * delta_z
     half_yaw = 0.5 * yaw_delta
     yaw_delta_quat = wp.quat(0.0, 0.0, wp.sin(half_yaw), wp.cos(half_yaw))
     pred_quat = wp.normalize(_quat_mul_xyzw(yaw_delta_quat, sim_quat))
 
     pred_linear_velocity = wp.vec3(
-        sim_linear_velocity[0] + dt * delta_a_world_x,
-        sim_linear_velocity[1] + dt * delta_a_world_y,
+        sim_linear_velocity[0] + velocity_scale * delta_world_x,
+        sim_linear_velocity[1] + velocity_scale * delta_world_y,
         sim_linear_velocity[2],
     )
     pred_angular_velocity = wp.vec3(
         sim_angular_velocity[0],
         sim_angular_velocity[1],
-        sim_angular_velocity[2] + dt * delta_alpha_z,
+        sim_angular_velocity[2] + velocity_scale * delta_z,
     )
 
     pred_body_q[body_id] = wp.transform(pred_pos, pred_quat)
