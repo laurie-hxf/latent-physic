@@ -412,6 +412,40 @@ def quaternion_angle_distance(q0: np.ndarray, q1: np.ndarray) -> float:
     return float(2.0 * np.arccos(np.clip(dot, -1.0, 1.0)))
 
 
+def yaw_from_quaternion_wxyz(quaternion: np.ndarray) -> float:
+    w, x, y, z = normalize_vector(np.asarray(quaternion, dtype=np.float64))
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
+def wrapped_angle_delta(angle: float) -> float:
+    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def final_pose_comparison_metrics(
+    source_position: np.ndarray,
+    source_quaternion_wxyz: np.ndarray,
+    compared_position: np.ndarray,
+    compared_quaternion_wxyz: np.ndarray,
+) -> dict[str, float]:
+    source_position = np.asarray(source_position, dtype=np.float64)
+    compared_position = np.asarray(compared_position, dtype=np.float64)
+    source_yaw = yaw_from_quaternion_wxyz(source_quaternion_wxyz)
+    compared_yaw = yaw_from_quaternion_wxyz(compared_quaternion_wxyz)
+    yaw_delta = wrapped_angle_delta(compared_yaw - source_yaw)
+    position_delta = compared_position - source_position
+    return {
+        "final_position_delta_norm": float(np.linalg.norm(position_delta)),
+        "final_xy_position_delta_norm": float(np.linalg.norm(position_delta[:2])),
+        "final_position_delta_x": float(position_delta[0]),
+        "final_position_delta_y": float(position_delta[1]),
+        "final_position_delta_z": float(position_delta[2]),
+        "final_yaw_source": float(source_yaw),
+        "final_yaw_compared": float(compared_yaw),
+        "final_yaw_delta": float(yaw_delta),
+        "final_yaw_delta_abs": float(abs(yaw_delta)),
+    }
+
+
 def trajectory_motion_metrics(rows: list[list[float]]) -> dict[str, float]:
     matrix = trajectory_rows_to_matrix(rows)
     if matrix.shape[0] == 0:
@@ -843,6 +877,28 @@ def set_uniform_block_friction(model: mujoco.MjModel, friction_mu: float) -> Non
         model.geom_friction[geom_id, :] = np.array([float(friction_mu), 0.0, 0.0], dtype=np.float64)
 
 
+def set_split_block_friction(model: mujoco.MjModel, left_mu: float, right_mu: float) -> None:
+    friction_by_geom = {
+        "push_block_left": float(left_mu),
+        "push_block_right": float(right_mu),
+    }
+    for geom_name, friction_mu in friction_by_geom.items():
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        if geom_id < 0:
+            raise ValueError(f"Could not find geom '{geom_name}' for split friction override.")
+        model.geom_friction[geom_id, :] = np.array([friction_mu, 0.0, 0.0], dtype=np.float64)
+
+
+def block_friction_values(model: mujoco.MjModel) -> dict[str, list[float]]:
+    values: dict[str, list[float]] = {}
+    for geom_name in BLOCK_FRICTION_GEOM_NAMES:
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        if geom_id < 0:
+            raise ValueError(f"Could not find geom '{geom_name}'.")
+        values[geom_name] = model.geom_friction[geom_id].astype(float).tolist()
+    return values
+
+
 def format_friction_tag(friction_mu: float) -> str:
     return f"{float(friction_mu):.6g}".replace("-", "m").replace(".", "p")
 
@@ -852,21 +908,82 @@ def sample_point_offset(
     bounds_min: np.ndarray,
     bounds_max: np.ndarray,
     edge_margin_ratio: float,
+    mode: str = "surface",
 ) -> np.ndarray:
     span = bounds_max - bounds_min
     inner_min = bounds_min + edge_margin_ratio * span
     inner_max = bounds_max - edge_margin_ratio * span
     point = rng.uniform(inner_min, inner_max)
-    faces = (
+    side_faces = (
         (0, bounds_min[0] + SURFACE_EPS),
         (0, bounds_max[0] - SURFACE_EPS),
         (1, bounds_min[1] + SURFACE_EPS),
         (1, bounds_max[1] - SURFACE_EPS),
+    )
+    all_faces = (
+        *side_faces,
         (2, bounds_max[2] - SURFACE_EPS),
     )
-    axis, value = faces[int(rng.integers(0, len(faces)))]
-    point[axis] = value
+    if mode == "surface":
+        axis, value = all_faces[int(rng.integers(0, len(all_faces)))]
+        point[axis] = value
+    elif mode == "side":
+        axis, value = side_faces[int(rng.integers(0, len(side_faces)))]
+        point[axis] = value
+    elif mode == "edge":
+        axes = rng.choice(np.array([0, 1, 2]), size=2, replace=False)
+        for axis in axes:
+            if axis == 2:
+                point[axis] = bounds_max[axis] - SURFACE_EPS
+            else:
+                point[axis] = (bounds_min[axis] + SURFACE_EPS) if rng.random() < 0.5 else (bounds_max[axis] - SURFACE_EPS)
+    elif mode == "corner":
+        for axis in range(3):
+            if axis == 2:
+                point[axis] = bounds_max[axis] - SURFACE_EPS
+            else:
+                point[axis] = (bounds_min[axis] + SURFACE_EPS) if rng.random() < 0.5 else (bounds_max[axis] - SURFACE_EPS)
+    else:
+        raise ValueError(f"Unknown point sampling mode: {mode}")
     return point.astype(np.float64)
+
+
+def sample_push_direction_for_point(
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    point_offset: np.ndarray,
+) -> np.ndarray:
+    if args.push_direction_mode == "random":
+        return sample_direction(rng, args.dir_z_min, args.dir_z_max)
+
+    point_xy = np.asarray(point_offset[:2], dtype=np.float64)
+    point_norm = float(np.linalg.norm(point_xy))
+    if point_norm < 1.0e-10:
+        return sample_direction(rng, args.dir_z_min, args.dir_z_max)
+
+    radial = point_xy / point_norm
+    tangent = np.array([-radial[1], radial[0]], dtype=np.float64)
+    if rng.random() < 0.5:
+        tangent = -tangent
+
+    if args.push_direction_mode == "tangential":
+        xy = tangent
+    elif args.push_direction_mode == "inward-tangential":
+        tangential_weight = float(args.push_tangential_weight)
+        inward_weight = float(args.push_inward_weight)
+        xy = tangential_weight * tangent - inward_weight * radial
+        xy_norm = float(np.linalg.norm(xy))
+        if xy_norm < 1.0e-10:
+            xy = tangent
+        else:
+            xy = xy / xy_norm
+    else:
+        raise ValueError(f"Unknown push direction mode: {args.push_direction_mode}")
+
+    z = float(rng.uniform(args.dir_z_min, args.dir_z_max))
+    z = float(np.clip(z, -0.95, 0.95))
+    radial_scale = float(np.sqrt(max(0.0, 1.0 - z * z)))
+    return np.array([radial_scale * xy[0], radial_scale * xy[1], z], dtype=np.float64)
 
 
 def write_batched_dataset_npz(
@@ -1076,6 +1193,7 @@ def generate_uniform_friction_datasets(
             "mode": "dataset_uniform_friction_replay",
             "source_dataset_path": str(args.dataset_path.resolve()),
             "source_force_replay": True,
+            "source_block_friction": source_summary_metadata.get("block_friction"),
             "friction_override": {
                 geom_name: [float(friction_mu), 0.0, 0.0]
                 for geom_name in BLOCK_FRICTION_GEOM_NAMES
@@ -1099,6 +1217,72 @@ def generate_uniform_friction_datasets(
         print(f"[uniform-friction mu={float(friction_mu):.6g}] dataset_path: {dataset_path}")
         print(f"[uniform-friction mu={float(friction_mu):.6g}] metadata_path: {metadata_path}")
     return written_paths
+
+
+def simulate_uniform_comparison_rollouts(
+    args: argparse.Namespace,
+    source_episode_metadata: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    comparisons: dict[str, dict[str, object]] = {}
+    if not args.uniform_friction_mu:
+        return comparisons
+
+    source_position = np.asarray(source_episode_metadata["final_block_position_world"], dtype=np.float64)
+    source_quaternion = np.asarray(source_episode_metadata["final_block_quaternion_world"], dtype=np.float64)
+
+    for friction_mu in args.uniform_friction_mu:
+        model = mujoco.MjModel.from_xml_path(str(args.scene))
+        set_uniform_block_friction(model, float(friction_mu))
+        data = mujoco.MjData(model)
+        reset_scene(model, data)
+        set_block_freejoint_pose(
+            model,
+            data,
+            np.asarray(source_episode_metadata["initial_block_position_world"], dtype=np.float64),
+            np.asarray(source_episode_metadata["initial_block_quaternion_world"], dtype=np.float64),
+        )
+        force_schedule = list(source_episode_metadata["force_schedule"])
+        first_segment = first_force_segment(force_schedule)
+        trajectory_rows: list[list[float]] = []
+        result = simulate_force(
+            model,
+            data,
+            np.asarray(first_segment["force_world"], dtype=np.float64),
+            np.asarray(source_episode_metadata["point_offset_local"], dtype=np.float64),
+            float(source_episode_metadata["force_duration"]),
+            float(source_episode_metadata["total_duration"]),
+            trajectory_rows=trajectory_rows,
+            stop_on_rest=True,
+            video_frame_stride=int(args.video_frame_stride),
+            force_schedule=force_schedule,
+        )
+        metrics = final_pose_comparison_metrics(
+            source_position,
+            source_quaternion,
+            result["final_block_position_world"],
+            result["final_block_quaternion_world"],
+        )
+        tag = format_friction_tag(float(friction_mu))
+        comparisons[tag] = {
+            "uniform_friction_mu": float(friction_mu),
+            "final_block_position_world": result["final_block_position_world"].tolist(),
+            "final_block_quaternion_world": result["final_block_quaternion_world"].tolist(),
+            "recorded_samples": int(result["recorded_samples"]),
+            "recorded_end_time": float(result["recorded_end_time"]),
+            "rest_reached": bool(result["rest_reached"]),
+            **metrics,
+        }
+    return comparisons
+
+
+def uniform_difference_score(comparisons: dict[str, dict[str, object]], yaw_weight: float) -> float:
+    if not comparisons:
+        return 0.0
+    scores = [
+        float(item["final_xy_position_delta_norm"]) + float(yaw_weight) * float(item["final_yaw_delta_abs"])
+        for item in comparisons.values()
+    ]
+    return float(max(scores, default=0.0))
 
 
 def generate_dataset(
@@ -1127,8 +1311,14 @@ def generate_dataset(
                 reset_scene(model, data)
                 initial_pose = apply_dataset_initial_pose(args, model, data, rng, bounds_min, bounds_max)
                 magnitude = float(rng.uniform(args.force_min, args.force_max))
-                direction = sample_direction(rng, args.dir_z_min, args.dir_z_max)
-                point_offset = sample_point_offset(rng, bounds_min, bounds_max, args.point_edge_margin_ratio)
+                point_offset = sample_point_offset(
+                    rng,
+                    bounds_min,
+                    bounds_max,
+                    args.point_edge_margin_ratio,
+                    mode=args.point_sampling_mode,
+                )
+                direction = sample_push_direction_for_point(rng, args, point_offset)
                 duration = float(rng.uniform(args.duration_min, args.duration_max))
                 force_schedule = sample_force_schedule(rng, args, magnitude, direction, duration)
                 force = np.asarray(first_force_segment(force_schedule)["force_world"], dtype=float)
@@ -1172,11 +1362,53 @@ def generate_dataset(
                     "motion_metrics": motion_metrics,
                     "motion_filter_passed": motion_filter_passed,
                     "motion_score": motion_score,
+                    "uniform_comparison": None,
+                    "uniform_difference_score": 0.0,
                 }
 
-                if best_rollout is None or motion_score > float(best_rollout["motion_score"]):
+                if (
+                    args.require_uniform_difference
+                    or args.min_uniform_final_xy_delta > 0.0
+                    or args.min_uniform_final_yaw_delta > 0.0
+                ):
+                    source_episode_metadata = {
+                        "initial_block_position_world": np.asarray(initial_pose["position"], dtype=float).tolist(),
+                        "initial_block_quaternion_world": np.asarray(
+                            initial_pose["quaternion_wxyz"],
+                            dtype=float,
+                        ).tolist(),
+                        "final_block_position_world": result["final_block_position_world"].tolist(),
+                        "final_block_quaternion_world": result["final_block_quaternion_world"].tolist(),
+                        "force_schedule": normalized_force_schedule,
+                        "point_offset_local": point_offset.tolist(),
+                        "force_duration": duration,
+                        "total_duration": float(args.total_duration),
+                    }
+                    uniform_comparison = simulate_uniform_comparison_rollouts(args, source_episode_metadata)
+                    uniform_score = uniform_difference_score(uniform_comparison, float(args.uniform_yaw_score_weight))
+                    uniform_filter_passed = (
+                        not args.require_uniform_difference
+                        or any(
+                            float(item["final_xy_position_delta_norm"]) >= float(args.min_uniform_final_xy_delta)
+                            and float(item["final_yaw_delta_abs"]) >= float(args.min_uniform_final_yaw_delta)
+                            for item in uniform_comparison.values()
+                        )
+                    )
+                    rollout["uniform_comparison"] = uniform_comparison
+                    rollout["uniform_difference_score"] = uniform_score
+                    rollout["uniform_difference_filter_passed"] = bool(uniform_filter_passed)
+                else:
+                    rollout["uniform_difference_filter_passed"] = True
+
+                rollout_score = motion_score + float(rollout["uniform_difference_score"])
+                best_score = -float("inf") if best_rollout is None else float(best_rollout["motion_score"]) + float(
+                    best_rollout["uniform_difference_score"]
+                )
+                if best_rollout is None or rollout_score > best_score:
                     best_rollout = rollout
-                if not args.require_motion or motion_filter_passed:
+                motion_ok = not args.require_motion or motion_filter_passed
+                uniform_ok = bool(rollout["uniform_difference_filter_passed"])
+                if motion_ok and uniform_ok:
                     accepted_rollout = rollout
                     break
 
@@ -1204,6 +1436,11 @@ def generate_dataset(
             trajectory_rows = accepted_rollout["trajectory_rows"]
             result = accepted_rollout["result"]
             motion_metrics = accepted_rollout["motion_metrics"]
+            uniform_comparison = accepted_rollout.get("uniform_comparison") or {}
+            uniform_difference_score_value = float(accepted_rollout.get("uniform_difference_score", float("nan")))
+            uniform_difference_filter_passed = bool(
+                accepted_rollout.get("uniform_difference_filter_passed", True)
+            )
 
             episode_video_path: Path | None = None
             if save_episode_video:
@@ -1273,6 +1510,9 @@ def generate_dataset(
                     "motion_filter_passed": bool(accepted_rollout["motion_filter_passed"]),
                     "motion_filter_attempts": int(accepted_rollout["attempt_id"]),
                     "motion_filter_score": float(accepted_rollout["motion_score"]),
+                    "uniform_difference_filter_passed": uniform_difference_filter_passed,
+                    "uniform_difference_score": uniform_difference_score_value,
+                    "uniform_comparison": uniform_comparison,
                     **motion_metrics,
                     "video_path": str(episode_video_path.resolve()) if episode_video_path is not None else None,
                 }
@@ -1306,10 +1546,27 @@ def generate_dataset(
         "force_segments": int(args.force_segments),
         "force_schedule_mode": "equal-duration-segments",
         "dir_z_range": [float(args.dir_z_min), float(args.dir_z_max)],
+        "push_direction_mode": str(args.push_direction_mode),
+        "push_tangential_weight": float(args.push_tangential_weight),
+        "push_inward_weight": float(args.push_inward_weight),
+        "point_sampling_mode": str(args.point_sampling_mode),
         "point_edge_margin_ratio": float(args.point_edge_margin_ratio),
+        "block_friction": block_friction_values(model),
+        "block_friction_override": (
+            None
+            if args.block_left_friction is None and args.block_right_friction is None
+            else {
+                "push_block_left": [float(args.block_left_friction), 0.0, 0.0],
+                "push_block_right": [float(args.block_right_friction), 0.0, 0.0],
+            }
+        ),
         "require_motion": bool(args.require_motion),
         "min_sliding_distance": float(args.min_sliding_distance),
         "min_rotation_angle": float(args.min_rotation_angle),
+        "require_uniform_difference": bool(args.require_uniform_difference),
+        "min_uniform_final_xy_delta": float(args.min_uniform_final_xy_delta),
+        "min_uniform_final_yaw_delta": float(args.min_uniform_final_yaw_delta),
+        "uniform_yaw_score_weight": float(args.uniform_yaw_score_weight),
         "max_resample_attempts": int(args.max_resample_attempts),
         "rejected_motion_attempts": int(rejected_motion_attempts),
         "mean_motion_filter_attempts": float(np.mean(motion_filter_attempts)) if motion_filter_attempts else 0.0,
@@ -1360,6 +1617,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("uniform-friction-mu values must be non-negative.")
     if args.uniform_friction_mu and args.num_episodes <= 0:
         raise ValueError("--uniform-friction-mu is only supported in dataset mode (--num-episodes > 0).")
+    if args.require_uniform_difference and not args.uniform_friction_mu:
+        raise ValueError("--require-uniform-difference requires at least one --uniform-friction-mu value.")
+    if args.min_uniform_final_xy_delta < 0.0:
+        raise ValueError("min-uniform-final-xy-delta must be non-negative.")
+    if args.min_uniform_final_yaw_delta < 0.0:
+        raise ValueError("min-uniform-final-yaw-delta must be non-negative.")
+    if args.uniform_yaw_score_weight < 0.0:
+        raise ValueError("uniform-yaw-score-weight must be non-negative.")
+    if args.push_tangential_weight < 0.0:
+        raise ValueError("push-tangential-weight must be non-negative.")
+    if args.push_inward_weight < 0.0:
+        raise ValueError("push-inward-weight must be non-negative.")
+    if (args.block_left_friction is None) != (args.block_right_friction is None):
+        raise ValueError("--block-left-friction and --block-right-friction must be supplied together.")
+    if args.block_left_friction is not None and args.block_left_friction < 0.0:
+        raise ValueError("block-left-friction must be non-negative.")
+    if args.block_right_friction is not None and args.block_right_friction < 0.0:
+        raise ValueError("block-right-friction must be non-negative.")
     if args.point_edge_margin_ratio < 0.0 or args.point_edge_margin_ratio >= 0.5:
         raise ValueError("point-edge-margin-ratio must be in [0, 0.5).")
     if args.min_sliding_distance < 0.0:
@@ -1451,6 +1726,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dir-z-min", type=float, default=-0.35, help="Minimum sampled Z component of force direction.")
     parser.add_argument("--dir-z-max", type=float, default=0.35, help="Maximum sampled Z component of force direction.")
     parser.add_argument(
+        "--push-direction-mode",
+        choices=("random", "tangential", "inward-tangential"),
+        default="random",
+        help=(
+            "Dataset force direction sampling. The tangential modes choose force directions from the local "
+            "application point to increase torque for eccentric and corner pushes."
+        ),
+    )
+    parser.add_argument(
+        "--push-tangential-weight",
+        type=float,
+        default=1.0,
+        help="Tangential XY weight for --push-direction-mode inward-tangential.",
+    )
+    parser.add_argument(
+        "--push-inward-weight",
+        type=float,
+        default=0.35,
+        help="Inward radial XY weight for --push-direction-mode inward-tangential.",
+    )
+    parser.add_argument(
+        "--point-sampling-mode",
+        choices=("surface", "side", "edge", "corner"),
+        default="surface",
+        help="Where to sample local force application points in dataset mode.",
+    )
+    parser.add_argument(
         "--point-edge-margin-ratio",
         type=float,
         default=0.08,
@@ -1501,6 +1803,45 @@ def parse_args() -> argparse.Namespace:
             "coefficient. These companion datasets replay the same accepted initial poses, force schedules, "
             "and local force points as the primary dataset."
         ),
+    )
+    parser.add_argument(
+        "--block-left-friction",
+        type=float,
+        default=None,
+        help="Override sliding friction for push_block_left in the primary dataset.",
+    )
+    parser.add_argument(
+        "--block-right-friction",
+        type=float,
+        default=None,
+        help="Override sliding friction for push_block_right in the primary dataset.",
+    )
+    parser.add_argument(
+        "--require-uniform-difference",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In dataset mode, reject sampled rollouts unless at least one companion uniform replay differs "
+            "from the primary rollout by the requested final XY and yaw thresholds."
+        ),
+    )
+    parser.add_argument(
+        "--min-uniform-final-xy-delta",
+        type=float,
+        default=0.0,
+        help="Minimum final XY position delta in meters for --require-uniform-difference.",
+    )
+    parser.add_argument(
+        "--min-uniform-final-yaw-delta",
+        type=float,
+        default=0.0,
+        help="Minimum final yaw delta in radians for --require-uniform-difference.",
+    )
+    parser.add_argument(
+        "--uniform-yaw-score-weight",
+        type=float,
+        default=0.1,
+        help="Meters-per-radian weight used when ranking resampled attempts by uniform replay difference.",
     )
     parser.add_argument(
         "--video-frame-stride",
@@ -1560,6 +1901,8 @@ def main() -> None:
     validate_args(args)
 
     model = mujoco.MjModel.from_xml_path(str(args.scene))
+    if args.block_left_friction is not None and args.block_right_friction is not None:
+        set_split_block_friction(model, float(args.block_left_friction), float(args.block_right_friction))
     data = mujoco.MjData(model)
     reset_scene(model, data)
 
