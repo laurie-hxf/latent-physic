@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
-from pathlib import Path
 
 import numpy as np
 
@@ -84,62 +81,6 @@ def resolve_checkpoint_point_cloud_path(args: argparse.Namespace, iteration: int
 def should_save_iteration_checkpoint(args: argparse.Namespace, iteration: int) -> bool:
     checkpoint_every = int(args.checkpoint_every)
     return checkpoint_every > 0 and (iteration % checkpoint_every == 0 or iteration == int(args.opt_iters))
-
-
-def run_post_training_eval(args: argparse.Namespace) -> Path:
-    eval_script = Path(__file__).resolve().parent.parent / "visualization" / "evaluate_mujoco_contact_friction_experiment.py"
-    eval_output_dir = args.eval_output_root / args.experiment_dir.name
-    cmd = [
-        sys.executable,
-        str(eval_script),
-        "--experiment-dir",
-        str(args.experiment_dir),
-        "--eval-dataset",
-        str(args.eval_dataset),
-        "--output-root",
-        str(args.eval_output_root),
-        "--eval-batch-size",
-        str(args.eval_batch_size),
-        "--position-loss-weight",
-        str(args.position_loss_weight),
-        "--orientation-loss-weight",
-        str(args.orientation_loss_weight),
-        "--linear-velocity-loss-weight",
-        str(args.linear_velocity_loss_weight),
-        "--angular-velocity-loss-weight",
-        str(args.angular_velocity_loss_weight),
-        "--point-position-loss-reduction",
-        str(args.point_position_loss_reduction),
-        "--solver-iterations",
-        str(args.solver_iterations),
-        "--contact-stiffness",
-        str(args.contact_stiffness),
-        "--contact-damping",
-        str(args.contact_damping),
-        "--contact-margin",
-        str(args.contact_margin),
-        "--friction-contact-threshold",
-        str(args.friction_contact_threshold),
-        "--contact-mask-threshold",
-        str(args.contact_mask_threshold),
-        "--friction-regularization",
-        str(args.friction_regularization),
-    ]
-    if args.device is not None:
-        cmd.extend(["--device", str(args.device)])
-    if args.max_steps is not None:
-        cmd.extend(["--max-steps", str(args.max_steps)])
-    if args.eval_replay_limit is not None:
-        cmd.extend(["--replay-limit", str(args.eval_replay_limit)])
-    if args.eval_skip_replay:
-        cmd.append("--skip-replay")
-
-    log_message(
-        f"running post-training eval dataset={args.eval_dataset.resolve()} "
-        f"output_dir={eval_output_dir.resolve()}"
-    )
-    subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent), check=True)
-    return eval_output_dir
 
 
 def save_iteration_checkpoint_and_point_cloud(
@@ -277,4 +218,3 @@ def load_training_checkpoint(
         rng.bit_generator.state = rng_state
 
     return iteration, active_params, adam_m, adam_v, adam_step, best_loss, best_active_params, loss_history
-

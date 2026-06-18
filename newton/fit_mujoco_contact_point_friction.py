@@ -12,7 +12,6 @@ from mujoco_contact_friction_fit_utils import (
 from mujoco_contact_friction_fit_wandb import build_wandb_log_payload, init_wandb
 from fit_mujoco_contact_point_friction_checkpoint import (
     load_training_checkpoint,
-    run_post_training_eval,
     save_iteration_checkpoint_and_point_cloud,
     should_save_iteration_checkpoint,
 )
@@ -1001,11 +1000,6 @@ def main() -> None:
         log_message(f"point_cloud_written_to={args.point_cloud_path.resolve()}")
         if args.scene_usd_path is not None:
             log_message(f"scene_usd_written_to={args.scene_usd_path.resolve()}")
-        if args.eval_dataset is not None:
-            eval_output_dir = run_post_training_eval(args)
-            log_message(f"post_training_eval_written_to={eval_output_dir.resolve()}")
-            if wandb_run is not None:
-                wandb_run.summary["post_training_eval_dir"] = str(eval_output_dir.resolve())
     finally:
         if wandb_run is not None:
             wandb_run.finish()
